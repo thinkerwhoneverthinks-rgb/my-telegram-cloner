@@ -9,12 +9,10 @@ from telethon.sessions import StringSession
 from aiohttp import web
 
 # --- CONFIGURATION FROM ENVIRONMENT VARIABLES ---
-# No default credentials here. Hidden safely inside Render memory.
 API_ID_RAW = os.environ.get("API_ID")
 API_HASH = os.environ.get("API_HASH")
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
 
-# Crash intentionally with a clear message if environment setup is forgotten
 if not API_ID_RAW or not API_HASH:
     raise ValueError(
         "❌ CRITICAL CONFIGURATION ERROR:\n"
@@ -34,16 +32,14 @@ BASE_DELAY_MAX = 5.5
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Initialize Client using StringSession for cloud container safety
 if SESSION_STRING:
     client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 else:
     client = TelegramClient('history_cloner_session', API_ID, API_HASH)
 
-# Global configuration state
 bot_data = {
     "dest_link": None,
-    "tasks": {},  # Format: {1: {"start": X, "end": Y, "msg": Z}, ...}
+    "tasks": {},
     "is_running": False
 }
 
@@ -115,7 +111,7 @@ async def start_handler(event):
     for i in range(1, 6):
         task = bot_data["tasks"].get(i, {})
         t_status = "Ready" if "start" in task and "end" in task else "Not configured"
-        m_status = "With completion message" if task.get("msg") else "No custom message"
+        m_status = "With header message" if task.get("msg") else "No custom message"
         status += f"▪️ **Task {i}:** {t_status} ({m_status})\n"
         
     status += "\n💡 *Commands available: /setdest, /task1-5, /mes1-5, /clear, and /done.*"
@@ -134,21 +130,30 @@ async def tasks_handler(event):
     args = event.pattern_match.group(2)
     
     if not args:
-        await event.reply(f"⚠️ **Usage:** `/task{task_num} [start_link] [end_link]`")
+        await event.reply(f"⚠️ **Usage:** `/task{task_num} [link/start-end]`\nExample: `/task1 https://t.me/c/3935930009/3-15`")
         return
         
-    links = args.split()
-    if len(links) != 2:
-        await event.reply(f"❌ **Error:** Provide exactly two space-separated links for `/task{task_num}`.")
+    # Regex to capture the base URL and the start/end numbers
+    match = re.search(r'^(.*(?:/))(\d+)-(\d+)$', args.strip())
+    if not match:
+        await event.reply(f"❌ **Error:** Invalid format. Provide link like `https://t.me/c/3935930009/3-15`.")
         return
+        
+    base_url = match.group(1)
+    
+    # Sort them just in case you accidentally write 15-3 instead of 3-15
+    ids = sorted([int(match.group(2)), int(match.group(3))])
+    
+    start_link = f"{base_url}{ids[0]}"
+    end_link = f"{base_url}{ids[1]}"
         
     if task_num not in bot_data["tasks"]:
         bot_data["tasks"][task_num] = {}
         
-    bot_data["tasks"][task_num]["start"] = links[0].strip()
-    bot_data["tasks"][task_num]["end"] = links[1].strip()
+    bot_data["tasks"][task_num]["start"] = start_link
+    bot_data["tasks"][task_num]["end"] = end_link
     save_config()
-    await event.reply(f"✅ **Task {task_num} Configured:**\n🛫 Start: {links[0]}\n🛬 End: {links[1]}")
+    await event.reply(f"✅ **Task {task_num} Configured:**\n🛫 Start: {start_link}\n🛬 End: {end_link}")
 
 @client.on(events.NewMessage(pattern=r'^/mes([1-5])(?:\s+(.+))?$', outgoing=True))
 async def message_handler(event):
@@ -159,9 +164,9 @@ async def message_handler(event):
         if task_num in bot_data["tasks"] and "msg" in bot_data["tasks"][task_num]:
             del bot_data["tasks"][task_num]["msg"]
             save_config()
-            await event.reply(f"🗑️ Removed completion text message for **Task {task_num}**.")
+            await event.reply(f"🗑️ Removed pre-task header message for **Task {task_num}**.")
         else:
-            await event.reply(f"⚠️ **Usage:** `/mes{task_num} [Your custom trailing message text]`")
+            await event.reply(f"⚠️ **Usage:** `/mes{task_num} [Your custom header message text]`")
         return
 
     if task_num not in bot_data["tasks"]:
@@ -169,7 +174,7 @@ async def message_handler(event):
         
     bot_data["tasks"][task_num]["msg"] = msg_text.strip()
     save_config()
-    await event.reply(f"💬 **Completion message linked to Task {task_num}:**\n\"{msg_text.strip()}\"")
+    await event.reply(f"💬 **Header message linked to Task {task_num} (Sends BEFORE task):**\n\"{msg_text.strip()}\"")
 
 @client.on(events.NewMessage(pattern=r'^/clear$', outgoing=True))
 async def clear_handler(event):
@@ -196,6 +201,7 @@ async def done_handler(event):
     status_msg = await event.reply("🚀 **Processing Queue Batch Sequence...** You can safely turn off your connection now.")
     
     dest_chat, dest_topic_id, _ = parse_telegram_link(bot_data["dest_link"], is_destination=True)
+    task_summaries = []  # List to store our final output summaries
     
     try:
         for sorted_id in sorted(active_tasks.keys()):
@@ -209,10 +215,19 @@ async def done_handler(event):
                 await event.reply(f"❌ Core link parsing exception on **Task {sorted_id}**. Skipping partition.")
                 continue
 
+            # --- SENDS MESSAGE BEFORE THE TASK STARTS ---
+            if "msg" in task:
+                if dest_topic_id:
+                    await client.send_message(dest_chat, task["msg"], reply_to=dest_topic_id)
+                else:
+                    await client.send_message(dest_chat, task["msg"])
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+
             iter_kwargs = {'entity': src_chat, 'min_id': start_id - 1, 'max_id': end_id + 1, 'reverse': True}
             if src_topic_id: iter_kwargs['reply_to'] = src_topic_id
 
             success_count, skip_count = 0, 0
+            vid_count, file_count = 0, 0
             
             async for message in client.iter_messages(**iter_kwargs):
                 if message is None or getattr(message, 'action', None) or getattr(message, '_empty', False) or (not message.text and not getattr(message, 'media', None)):
@@ -221,6 +236,15 @@ async def done_handler(event):
                     
                 if await copy_with_retry(message, dest_chat, dest_topic_id=dest_topic_id):
                     success_count += 1
+                    
+                    # --- COUNT VIDEOS AND FILES ---
+                    # In Telethon, if it's a video, message.video is truthy.
+                    if message.video:
+                        vid_count += 1
+                    # If it's a document (PDF, zip, etc.) but NOT a video
+                    elif message.document:
+                        file_count += 1
+                        
                     await asyncio.sleep(random.uniform(BASE_DELAY_MIN, BASE_DELAY_MAX))
                 else:
                     await event.reply(f"🛑 Execution structural failure. Target protection triggered at message: {message.id}")
@@ -229,17 +253,24 @@ async def done_handler(event):
             
             await event.reply(f"✅ **Task {sorted_id} Sequence Concluded!**\nTransferred: {success_count}\nSkipped: {skip_count}")
             
-            # Anti-ban rest cool down before dropping trailing strings
+            # --- BUILD SUMMARY FOR THIS TASK ---
+            summary_chunk = ""
             if "msg" in task:
-                await asyncio.sleep(random.uniform(4.0, 7.0))
-                if dest_topic_id:
-                    await client.send_message(dest_chat, task["msg"], reply_to=dest_topic_id)
-                else:
-                    await client.send_message(dest_chat, task["msg"])
+                summary_chunk += f"{task['msg']}\n"
+            summary_chunk += f"{vid_count} vid {file_count} file"
+            task_summaries.append(summary_chunk)
             
             # Substantial interval padding buffer between autonomous pipeline tasks
             await asyncio.sleep(random.uniform(10.0, 20.0))
             
+        # --- SEND FINAL INDEX REPORT ONCE EVERYTHING IS DONE ---
+        if task_summaries:
+            final_report = "\n\n".join(task_summaries)
+            if dest_topic_id:
+                await client.send_message(dest_chat, final_report, reply_to=dest_topic_id)
+            else:
+                await client.send_message(dest_chat, final_report)
+
         await status_msg.edit("🏆 **Queue executed successfully!** Tasks cleared out.")
         bot_data["tasks"] = {}
         save_config()
