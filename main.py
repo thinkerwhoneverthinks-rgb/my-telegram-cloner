@@ -52,6 +52,7 @@ def load_config():
                 saved = json.load(f)
                 bot_data["dest_link"] = saved.get("dest_link")
                 saved_slots = saved.get("slots", {})
+                # Ensure integer keys are maintained upon reading
                 bot_data["slots"] = {int(k): v for k, v in saved_slots.items()}
                 logger.info("Configuration loaded from file storage successfully.")
         except Exception as e:
@@ -63,6 +64,12 @@ def save_config():
             json.dump({"dest_link": bot_data["dest_link"], "slots": bot_data["slots"]}, f)
     except Exception as e:
         logger.error(f"Error saving updated configuration: {e}")
+
+def get_next_free_slot():
+    slot = 1
+    while slot in bot_data["slots"]:
+        slot += 1
+    return slot
 
 def parse_telegram_link(link, is_destination=False):
     if not link: return None, None, None
@@ -113,11 +120,11 @@ async def start_handler(event):
     else:
         for choice_id in sorted(bot_data["slots"].keys()):
             slot = bot_data["slots"][choice_id]
-            s_type = slot.get("type", "task").capitalize()
+            s_type = slot.get("type", "Unknown").upper()
             m_status = "With header" if slot.get("msg") else "No custom header"
             status += f"▪️ **Slot {choice_id} [{s_type}]:** Configured ({m_status})\n"
             
-    status += "\n💡 *Commands: /setdest, /taskX, /batchX, /mesX, /mebX, /pause, /resume, /delete taskX, /clear, and /done.*"
+    status += "\n💡 *Commands: /setdest, /task, /batch, /mesX, /mebX, /preview, /removeX, /pause, /resume, /delete taskX, /clear, and /done.*"
     await event.reply(status)
 
 @client.on(events.NewMessage(pattern=r'^/setdest\s+(.+)$', outgoing=True))
@@ -127,13 +134,16 @@ async def set_dest_handler(event):
     save_config()
     await event.reply(f"🎯 **Destination target mapped & saved:**\n{link}")
 
-@client.on(events.NewMessage(pattern=r'^/task(\d+)(?:\s+(.+))?$', outgoing=True))
+@client.on(events.NewMessage(pattern=r'^/task(\d+)?(?:\s+(.+))?$', outgoing=True))
 async def tasks_handler(event):
-    slot_num = int(event.pattern_match.group(1))
+    slot_raw = event.pattern_match.group(1)
     args = event.pattern_match.group(2)
     
+    is_auto = slot_raw is None
+    slot_num = get_next_free_slot() if is_auto else int(slot_raw)
+    
     if not args:
-        await event.reply(f"⚠️ **Usage:** `/task{slot_num} [link/start-end]`")
+        await event.reply(f"⚠️ **Usage:** `/task{slot_raw or ''} [link/start-end]`")
         return
         
     match = re.search(r'^(.*(?:/))(\d+)-(\d+)$', args.strip())
@@ -144,34 +154,43 @@ async def tasks_handler(event):
     base_url = match.group(1)
     ids = sorted([int(match.group(2)), int(match.group(3))])
     
-    if slot_num not in bot_data["slots"]:
-        bot_data["slots"][slot_num] = {"sent_ids": []}
-        
-    bot_data["slots"][slot_num]["type"] = "task"
-    bot_data["slots"][slot_num]["start"] = f"{base_url}{ids[0]}"
-    bot_data["slots"][slot_num]["end"] = f"{base_url}{ids[1]}"
+    # Initialize or clean slot tracking container
+    bot_data["slots"][slot_num] = bot_data["slots"].get(slot_num, {})
+    bot_data["slots"][slot_num].update({
+        "type": "task",
+        "start": f"{base_url}{ids[0]}",
+        "end": f"{base_url}{ids[1]}",
+        "sent_ids": bot_data["slots"][slot_num].get("sent_ids", [])
+    })
+    
     save_config()
-    await event.reply(f"✅ **Slot {slot_num} Configured as BOUNDED TASK.**")
+    prefix = "✅ Auto-assigned to" if is_auto else "✅ Configured"
+    await event.reply(f"{prefix} **Slot {slot_num} [BOUNDED TASK]**.")
 
-@client.on(events.NewMessage(pattern=r'^/batch(\d+)(?:\s+(.+))?$', outgoing=True))
+@client.on(events.NewMessage(pattern=r'^/batch(\d+)?(?:\s+(.+))?$', outgoing=True))
 async def batch_handler(event):
-    slot_num = int(event.pattern_match.group(1))
+    slot_raw = event.pattern_match.group(1)
     args = event.pattern_match.group(2)
     
+    is_auto = slot_raw is None
+    slot_num = get_next_free_slot() if is_auto else int(slot_raw)
+    
     if not args:
-        await event.reply(f"⚠️ **Usage:** `/batch{slot_num} [starting-link]`")
+        await event.reply(f"⚠️ **Usage:** `/batch{slot_raw or ''} [starting-link]`")
         return
         
-    if slot_num not in bot_data["slots"]:
-        bot_data["slots"][slot_num] = {"sent_ids": []}
-        
-    bot_data["slots"][slot_num]["type"] = "batch"
-    bot_data["slots"][slot_num]["start"] = args.strip()
+    bot_data["slots"][slot_num] = bot_data["slots"].get(slot_num, {})
+    bot_data["slots"][slot_num].update({
+        "type": "batch",
+        "start": args.strip(),
+        "sent_ids": bot_data["slots"][slot_num].get("sent_ids", [])
+    })
     if "end" in bot_data["slots"][slot_num]:
         del bot_data["slots"][slot_num]["end"]
         
     save_config()
-    await event.reply(f"✅ **Slot {slot_num} Configured as OPEN-ENDED BATCH.**")
+    prefix = "✅ Auto-assigned to" if is_auto else "✅ Configured"
+    await event.reply(f"{prefix} **Slot {slot_num} [OPEN-ENDED BATCH]**.")
 
 @client.on(events.NewMessage(pattern=r'^/(?:mes|meb)(\d+)(?:\s+(.+))?$', outgoing=True))
 async def message_handler(event):
@@ -192,6 +211,37 @@ async def message_handler(event):
     save_config()
     await event.reply(f"💬 **Header linked to Slot {slot_num}.**")
 
+@client.on(events.NewMessage(pattern=r'^/preview$', outgoing=True))
+async def preview_handler(event):
+    if not bot_data["slots"]:
+        await event.reply("📋 **Queue Pipeline Preview:**\n*The operation deployment queue is currently completely empty.*")
+        return
+        
+    preview_text = "👀 **Current Queue Pipeline Preview:**\n\n"
+    for choice_id in sorted(bot_data["slots"].keys()):
+        slot = bot_data["slots"][choice_id]
+        s_type = slot.get("type", "unknown").upper()
+        header = slot.get("msg", "*No header set for this slot*")
+        
+        preview_text += f"💬 Header {choice_id}: \"{header}\"\n"
+        if s_type == "TASK":
+            preview_text += f"▪️ Slot {choice_id} [{s_type}]:\n    🛫 Start: {slot.get('start')}\n    🛬 End: {slot.get('end')}\n\n"
+        else:
+            preview_text += f"▪️ Slot {choice_id} [{s_type}]: {slot.get('start')}\n\n"
+            
+    preview_text += "---\n🚀 *Ready to deploy? Send /done to start processing.*"
+    await event.reply(preview_text)
+
+@client.on(events.NewMessage(pattern=r'^/remove\s+(\d+)$', outgoing=True))
+async def remove_handler(event):
+    slot_num = int(event.pattern_match.group(1))
+    if slot_num in bot_data["slots"]:
+        del bot_data["slots"][slot_num]
+        save_config()
+        await event.reply(f"🗑️ **Slot {slot_num} Removed from Queue.** Links and headers deleted.")
+    else:
+        await event.reply(f"⚠️ **Error:** Slot {slot_num} is not present in the current local setup queue.")
+
 @client.on(events.NewMessage(pattern=r'^/pause$', outgoing=True))
 async def pause_handler(event):
     bot_data["is_paused"] = True
@@ -206,7 +256,7 @@ async def resume_handler(event):
 async def delete_handler(event):
     slot_num = int(event.pattern_match.group(1))
     if slot_num not in bot_data["slots"]:
-        await event.reply(f"❌ **Error:** Slot {slot_num} is not configured or has no cache tracking history.")
+        await event.reply(f"❌ **Error:** Slot {slot_num} is not configured or lacks cache history tracking tokens.")
         return
         
     slot = bot_data["slots"][slot_num]
@@ -215,7 +265,7 @@ async def delete_handler(event):
     if not sent_ids:
         del bot_data["slots"][slot_num]
         save_config()
-        await event.reply(f"🗑️ Slot {slot_num} had no messages sent. Setup completely wiped clean.")
+        await event.reply(f"🗑️ Slot {slot_num} had no history footprint. Local parameters wiped clean.")
         return
         
     dest_chat, _, _ = parse_telegram_link(bot_data["dest_link"], is_destination=True)
@@ -223,21 +273,21 @@ async def delete_handler(event):
         await event.reply("❌ **Error:** Destination target missing or completely unparseable.")
         return
         
-    progress_wipe = await event.reply(f"🗑️ **Bulk Deleting Slot {slot_num} items from destination...**")
+    progress_wipe = await event.reply(f"🗑️ **Bulk Deleting Slot {slot_num} elements from target destination...**")
     
     deleted_count = 0
-    # Vectorized chunk deletions using Telegram's native bulk capacities (Groups of 100)
+    # Process deletions efficiently via optimized array grouping (100 IDs per frame limit)
     for i in range(0, len(sent_ids), 100):
         chunk = sent_ids[i:i+100]
         try:
             await client.delete_messages(dest_chat, chunk)
             deleted_count += len(chunk)
         except Exception as e:
-            logger.error(f"Error executing bulk deletion chunk: {e}")
+            logger.error(f"Error executing bulk deletion chunk payload: {e}")
 
     del bot_data["slots"][slot_num]
     save_config()
-    await progress_wipe.edit(f"✅ **Wipe Concluded Successfully!** Removed {deleted_count} elements. Slot {slot_num} reset entirely.")
+    await progress_wipe.edit(f"✅ **Wipe Concluded Successfully!** Removed {deleted_count} messages. Slot {slot_num} completely reset.")
 
 @client.on(events.NewMessage(pattern=r'^/clear$', outgoing=True))
 async def clear_handler(event):
@@ -248,32 +298,37 @@ async def clear_handler(event):
 @client.on(events.NewMessage(pattern=r'^/done$', outgoing=True))
 async def done_handler(event):
     if bot_data["is_running"]:
-        await event.reply("⚠️ A execution sequence is actively processing in the cloud container container!")
+        await event.reply("⚠️ An execution sequence is actively processing in the cloud container container!")
         return
 
     if not bot_data["dest_link"]:
         await event.reply("❌ **Error:** Set target destination before triggering execution route.")
         return
 
-    active_slots = {k: v for k, v in bot_data["slots"].items() if "start" in v}
-    if not active_slots:
+    # Check for presence of any valid un-executed tasks
+    active_initial_check = {k: v for k, v in bot_data["slots"].items() if "start" in v}
+    if not active_initial_check:
         await event.reply("❌ **Error:** No active configuration payloads located inside the queue slots.")
         return
 
     bot_data["is_running"] = True
     bot_data["is_paused"] = False
-    status_msg = await event.reply("🚀 **Initializing Queue Layout...** Terminal operations running.")
+    status_msg = await event.reply("🚀 **Initializing Queue Layout...** Running sequence operations.")
     
     dest_chat, dest_topic_id, _ = parse_telegram_link(bot_data["dest_link"], is_destination=True)
     task_summaries = []
+    processed_slots = set()
     
     try:
-        sorted_keys = sorted(active_slots.keys())
-        max_key = max(sorted_keys)
-        
-        for sorted_id in sorted_keys:
-            # Check if slot was deleted while loop transitions slots
-            if sorted_id not in bot_data["slots"]: continue
+        while True:
+            # Re-scans configurations on-the-fly to allow real-time additions mid-run
+            current_active_slots = {k: v for k, v in bot_data["slots"].items() if "start" in v and k not in processed_slots}
+            if not current_active_slots:
+                break # Exit when all sequential slots have concluded processing completely
+                
+            sorted_keys = sorted(current_active_slots.keys())
+            sorted_id = sorted_keys[0]
+            max_key = max(sorted(bot_data["slots"].keys()))
             
             slot = bot_data["slots"][sorted_id]
             slot_type = slot.get("type", "task")
@@ -292,6 +347,7 @@ async def done_handler(event):
 
             if not src_chat or not start_id or (slot_type == "task" and not end_id) or not dest_chat:
                 await event.reply(f"❌ Core parsing failure on Slot {sorted_id}. Skipping sequence.")
+                processed_slots.add(sorted_id)
                 continue
 
             if "msg" in slot:
@@ -306,14 +362,14 @@ async def done_handler(event):
             async for message in client.iter_messages(**iter_kwargs):
                 # --- LIVE PAUSE INTERCEPTOR CHECKPOINT ---
                 if bot_data.get("is_paused", False):
-                    await status_msg.edit(f"⏸️ **Pipeline Interrupted (Paused).**\n📍 Holding current state at Message ID: `{message.id}`.")
+                    await status_msg.edit(f"⏸️ **Pipeline Interrupted (Paused).**\n📍 Holding state at Message ID: `{message.id}`.")
                     while bot_data.get("is_paused", False):
                         await asyncio.sleep(1)
                         if sorted_id not in bot_data["slots"]: break
                         
-                # Break clean if user deleted the running slot while paused
+                # Direct breakout safeguard if user deleted/removed the slot mid-run
                 if sorted_id not in bot_data["slots"]:
-                    await event.reply(f"🛑 Active Slot {sorted_id} configuration deleted. Killing stream processing loop.")
+                    await event.reply(f"🛑 Active Slot {sorted_id} configuration deleted. Killing stream loop execution.")
                     break
 
                 if message is None or getattr(message, 'action', None) or getattr(message, '_empty', False) or (not message.text and not getattr(message, 'media', None)):
@@ -355,6 +411,7 @@ async def done_handler(event):
                     bot_data["is_running"] = False
                     return
             
+            # Post-slot processing check to ensure tracking metrics remain accurate
             if sorted_id in bot_data["slots"]:
                 slot_title = f"Slot {sorted_id} ({slot_type.upper()})"
                 await event.reply(
@@ -366,16 +423,18 @@ async def done_handler(event):
                 task_summaries.append(summary_chunk)
                 await asyncio.sleep(random.uniform(10.0, 20.0))
             
+            processed_slots.add(sorted_id)
+            
         if task_summaries:
             final_report = "\n\n".join(task_summaries)
             await event.reply(f"📊 **Grand Final Execution Report:**\n\n{final_report}")
 
-        await status_msg.edit("🏆 **Queue executed successfully!** Active queue slots processed completely.")
+        await status_msg.edit("🏆 **Queue executed successfully!** All available operational blocks processed completely.")
         bot_data["slots"] = {}
         save_config()
 
     except Exception as e:
-        await event.reply(f"⚠️ Critical runtime framework error: `{e}`")
+        await event.reply(f"⚠️ Critical framework exception caught: `{e}`")
     finally:
         bot_data["is_running"] = False
         bot_data["is_paused"] = False
