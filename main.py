@@ -133,15 +133,12 @@ async def tasks_handler(event):
         await event.reply(f"⚠️ **Usage:** `/task{task_num} [link/start-end]`\nExample: `/task1 https://t.me/c/3935930009/3-15`")
         return
         
-    # Regex to capture the base URL and the start/end numbers
     match = re.search(r'^(.*(?:/))(\d+)-(\d+)$', args.strip())
     if not match:
         await event.reply(f"❌ **Error:** Invalid format. Provide link like `https://t.me/c/3935930009/3-15`.")
         return
         
     base_url = match.group(1)
-    
-    # Sort them just in case you accidentally write 15-3 instead of 3-15
     ids = sorted([int(match.group(2)), int(match.group(3))])
     
     start_link = f"{base_url}{ids[0]}"
@@ -201,7 +198,7 @@ async def done_handler(event):
     status_msg = await event.reply("🚀 **Processing Queue Batch Sequence...** You can safely turn off your connection now.")
     
     dest_chat, dest_topic_id, _ = parse_telegram_link(bot_data["dest_link"], is_destination=True)
-    task_summaries = []  # List to store our final output summaries
+    task_summaries = []
     
     try:
         for sorted_id in sorted(active_tasks.keys()):
@@ -215,7 +212,6 @@ async def done_handler(event):
                 await event.reply(f"❌ Core link parsing exception on **Task {sorted_id}**. Skipping partition.")
                 continue
 
-            # --- SENDS MESSAGE BEFORE THE TASK STARTS ---
             if "msg" in task:
                 if dest_topic_id:
                     await client.send_message(dest_chat, task["msg"], reply_to=dest_topic_id)
@@ -237,11 +233,8 @@ async def done_handler(event):
                 if await copy_with_retry(message, dest_chat, dest_topic_id=dest_topic_id):
                     success_count += 1
                     
-                    # --- COUNT VIDEOS AND FILES ---
-                    # In Telethon, if it's a video, message.video is truthy.
                     if message.video:
                         vid_count += 1
-                    # If it's a document (PDF, zip, etc.) but NOT a video
                     elif message.document:
                         file_count += 1
                         
@@ -253,23 +246,19 @@ async def done_handler(event):
             
             await event.reply(f"✅ **Task {sorted_id} Sequence Concluded!**\nTransferred: {success_count}\nSkipped: {skip_count}")
             
-            # --- BUILD SUMMARY FOR THIS TASK ---
             summary_chunk = ""
             if "msg" in task:
                 summary_chunk += f"{task['msg']}\n"
             summary_chunk += f"{vid_count} vid {file_count} file"
             task_summaries.append(summary_chunk)
             
-            # Substantial interval padding buffer between autonomous pipeline tasks
             await asyncio.sleep(random.uniform(10.0, 20.0))
             
-        # --- SEND FINAL INDEX REPORT ONCE EVERYTHING IS DONE ---
+        # --- SEND FINAL INDEX REPORT TO THE COMMAND CHAT ---
         if task_summaries:
             final_report = "\n\n".join(task_summaries)
-            if dest_topic_id:
-                await client.send_message(dest_chat, final_report, reply_to=dest_topic_id)
-            else:
-                await client.send_message(dest_chat, final_report)
+            # This sends the final report back to the chat where you sent /done
+            await event.reply(f"📊 **Final Execution Report:**\n\n{final_report}")
 
         await status_msg.edit("🏆 **Queue executed successfully!** Tasks cleared out.")
         bot_data["tasks"] = {}
