@@ -1,11 +1,11 @@
 # ⚠️ READ THIS CAREFULLY BEFORE STARTING ⚠️
-> **IMPORTANT NOTICE:** This guide contains complete, end-to-end instructions for deploying, generating credentials (`API_ID`, `API_HASH`, `SESSION_STRING`), configuring 24/7 cloud uptime with **UptimeRobot**, and using all commands with practical examples (including how to consolidate 6–7 different topics into a single destination topic). Read every section step-by-step.
+> **IMPORTANT NOTICE:** This guide contains complete, end-to-end instructions for deploying, generating credentials (`API_ID`, `API_HASH`, `SESSION_STRING`), configuring 24/7 cloud uptime with **UptimeRobot**, and using the automated multi-topic queue, whole-group forum topic auto-discovery, Anonymous Admin settings, and all commands with practical examples. Read every section step-by-step.
 
 ---
 
 # 🚀 Telegram Channel & Forum Topic Cloner (Safe 100-Batch Edition)
 
-An asynchronous, cloud-ready Telegram userbot built with **Telethon** and **aiohttp**. Designed to clone and forward messages between public/private channels, groups, and forum topics with **ultra-safe anti-detection timings**, **100-message batch forwarding (without quote tags)**, **smart topic mirroring**, and **Saved Messages crash-proof brain storage**.
+An asynchronous, cloud-ready Telegram userbot built with **Telethon** and **aiohttp**. Designed to clone and forward messages between public/private channels, groups, and forum topics with **ultra-safe anti-detection timings**, **100-message batch forwarding (without quote tags)**, **multi-link task queues**, **whole-group topic auto-discovery**, **Anonymous Admin / Send-As support**, and **Saved Messages crash-proof brain storage**.
 
 ---
 
@@ -15,23 +15,26 @@ An asynchronous, cloud-ready Telegram userbot built with **Telethon** and **aioh
 3. [Deploying to Render (24/7 Cloud Hosting)](#-2-deploying-to-render-free-cloud-service)
 4. [Keeping the Bot Alive 24/7 with UptimeRobot](#-3-keeping-the-bot-alive-with-uptimerobot)
 5. [Command Reference & Practical Examples](#-4-command-reference)
-6. [Special Workflow: Cloning 6–7 Topics into a Single Topic](#-5-special-workflow-how-to-clone-67-topics-into-a-single-destination-topic)
-7. [Safety Timings & Anti-Ban Architecture](#-6-safety-delays--anti-ban-architecture)
-8. [Automatic Forward Lock & Cloud Brain Storage](#-7-forward-lock-monitor--brain-storage)
+6. [Multi-Topic Queuing: Set Many Topics and Sleep](#-5-multi-topic-queuing-set-many-topics-and-sleep)
+7. [Whole-Group Topic Auto-Discovery](#-6-whole-group-topic-auto-discovery)
+8. [Anonymous Admin & Send-As Identity](#-7-anonymous-admin--sending-under-groupchannel-name)
+9. [Safety Delays & Anti-Ban Architecture](#-8-safety-delays--anti-ban-architecture)
+10. [Automatic Forward Lock & Cloud Brain Storage](#-9-forward-lock-monitor--brain-storage)
 
 ---
 
 ## 🌟 Key Features
 
-* **Native 100-Batch Forwarding (`drop_author=True`):** Forwards up to 100 messages at once without the *"Forwarded from"* tag. Albums and multi-photo media remain intact.
-* **Smart Topic Mirroring & Auto-Titles:** Automatically detects the source forum topic name and either creates a matching topic in your target group or posts a pinned header.
-* **Consolidated Topic Support:** Easily forward multiple separate topics into one single destination topic with pinned dividers.
+* **Multi-Topic Task Queue:** Paste 5, 10, or 20+ topic/channel links at once. The bot processes them sequentially in the background while you close Telegram and sleep.
+* **Whole-Group Forum Topic Auto-Discovery:** Paste just the group link (`https://t.me/c/1234567890`), and the bot automatically fetches **every single topic** inside that group and queues them!
+* **Native 100-Batch Forwarding (`drop_author=True`):** Forwards up to 100 messages per request without the *"Forwarded from"* tag. Albums and multi-photo media remain intact.
+* **Anonymous Admin & Send-As Support:** Compatible with "Remain Anonymous" admin rights (messages sent under Group Name), plus custom `/setsendas` to post under a specific channel.
 * **Forward Lock Detection (5-Minute Monitor):** If a source channel enables *"Restrict saving content"*, the bot pauses and checks every 5 minutes. The second it unlocks, it auto-resumes!
 * **Ultra-Safe Timings (Zero Account Flags):**
   * `35 to 50 seconds` randomized delay between 100-message batches.
   * `5 to 8 minutes` human breather pause every `4 to 8` batches.
   * Checks forward lock every `5 minutes` (virtually 0 API footprint).
-* **Saved Messages Brain Storage:** Backs up task state and progress in a pinned message in your Telegram **Saved Messages** (`me`), surviving cloud server reboots.
+* **Saved Messages Brain Storage:** Backs up the entire queue, active item, and message IDs in a pinned message in your Telegram **Saved Messages** (`me`), surviving cloud server reboots.
 
 ---
 
@@ -154,67 +157,80 @@ All commands must be sent from your own Telegram account (outgoing messages):
 | Command | Usage | What it does |
 | :--- | :--- | :--- |
 | **`/setdest <link>`** | `/setdest https://t.me/c/1234567890/55` | Saves your target group, channel, or topic permanently. |
-| **`/clone <link>`** | `/clone https://t.me/c/987654321/10` | **All-in-one clone command.** Auto-detects topics, ranges, or whole channels. |
-| **`/clone <link> new`** | `/clone https://t.me/c/987654321/10 new` | Forces creating a new topic with matching title in destination group. |
-| **`/clone <link> here`** | `/clone https://t.me/c/987654321/10 here` | Forwards into your set destination topic with a pinned header divider. |
-| **`/status`** | `/status` | Shows live progress, batch count, and delay countdowns. |
+| **`/setsendas <link\|off>`** | `/setsendas @MyChannel` | Sets a channel to send as, or `off` for default (Anonymous Admin). |
+| **`/clone [new\|here] <links>`** | `/clone here https://t.me/c/.../1 https://t.me/c/.../2` | **Queues 1 or many links** (or entire groups). Runs in background! |
+| **`/queue`** | `/queue` | Displays all pending and active items in the queue. |
+| **`/status`** | `/status` | Shows live progress, active item, batch count, and breather countdown. |
 | **`/pause`** | `/pause` | Safely freezes the clone loop at the next batch. |
 | **`/resume`** | `/resume` | Unpauses and continues forwarding. |
-| **`/stop`** | `/stop` | Cancels the active task completely. |
+| **`/stop`** | `/stop` | Cancels the active task completely and clears queue. |
 | **`/purge`** | `/purge` | Bulk-deletes all messages forwarded in this/last task from destination in chunks of 100. |
 
 ---
 
-## 🎯 5. Special Workflow: How to Clone 6–7 Topics into a Single Destination Topic
+## 📦 5. Multi-Topic Queuing: Set Many Topics and Sleep
 
-If you have **6 to 7 different topics** from a source group and you want **all of them to be forwarded into ONE single topic** in your destination group:
+Instead of running commands one by one, you can feed multiple links into `/clone` separated by spaces or newlines:
 
-### Step 1: Set your destination once to that specific topic
-Copy the link to your destination topic in your group:
 ```text
-/setdest https://t.me/c/1234567890/99
+/clone here
+https://t.me/c/987654321/10
+https://t.me/c/987654321/11
+https://t.me/c/987654321/12
+https://t.me/channel_example
 ```
-*(Here `99` is your single destination topic ID)*.
+
+### What Happens:
+1. The bot queues all links into an internal pipeline.
+2. It processes Topic 1, finishes it, then automatically moves to Topic 2, Topic 3, etc.
+3. For each topic/channel, it sends a pinned header divider in your destination, then forwards all 100-batch messages under it.
+4. **You can turn off Telegram and sleep!** The bot will work through the entire list on Render.
 
 ---
 
-### Step 2: Clone Topic 1
-Run `/clone` on the first topic:
+## 🔍 6. Whole-Group Topic Auto-Discovery
+
+If you want to clone an entire group that has multiple forum topics, you **do not need to copy each topic link individually**.
+
+Simply paste the **root group link**:
 ```text
-/clone https://t.me/c/987654321/10 here
+/clone https://t.me/c/1234567890 here
 ```
-**What happens:**
-1. The bot fetches Topic 1's title (e.g. *"Physics - Kinematics"*).
-2. It sends a divider header into your destination topic `99`:
-   ```text
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   📚 Topic: Physics - Kinematics
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-   ```
-3. It pins that message inside topic `99`.
-4. It forwards all messages of Topic 1 in batches of 100 (without quote tags).
+*(Or `/clone https://t.me/c/1234567890 new` if you want it to create matching topics in your destination)*.
+
+### What Happens:
+1. The bot detects that the link is a forum group.
+2. It automatically calls `GetForumTopicsRequest` to discover **all topics** inside that group.
+3. It adds all discovered topics to the queue in order and processes them sequentially!
 
 ---
 
-### Step 3: Clone Topic 2, Topic 3, ... Topic 7
-When Topic 1 finishes, simply run:
+## 🕵️ 7. Anonymous Admin & Sending Under Group/Channel Name
+
+### Case A: "Remain Anonymous" Admin in Destination Group (Default)
+If your Telegram account is an Admin in the destination group with the permission **"Remain Anonymous"** enabled:
+* Telegram handles this natively on the server side.
+* All header messages, pins, and forwarded batches sent by the bot will automatically show the **Group’s Name** as the sender.
+* Your personal name and profile photo will **never** be displayed.
+
+### Case B: Sending as a Specific Channel (`/setsendas`)
+If you want messages to be posted under a specific public channel you own:
 ```text
-/clone https://t.me/c/987654321/11 here
+/setsendas @MyPublicChannel
 ```
-Then for Topic 3:
+To turn it off and return to default / anonymous admin:
 ```text
-/clone https://t.me/c/987654321/12 here
+/setsendas off
 ```
-**Result:** All 6–7 topics will be cleanly organized one after another inside your single topic, each with its own pinned header banner and zero clutter!
 
 ---
 
-## 🛡️ 6. Safety Delays & Anti-Ban Architecture
+## 🛡️ 8. Safety Delays & Anti-Ban Architecture
 
 To ensure your Telegram account is **100% safe from bans, spam flags, and FloodWait restrictions**:
 
 * **Batch Delay (`35.0` to `50.0` seconds):**
-  Instead of forwarding messages instantly, the bot waits 35 to 50 seconds (with randomized micro-jitter) between every 100-message batch.
+  Waits 35 to 50 seconds (with randomized micro-jitter) between every 100-message batch.
 * **Human Breather Pause (`5 to 8 minutes` every `4 to 8` batches):**
   After forwarding 400 to 800 messages, the bot pauses for 5 to 8 minutes (`300s` to `480s`). This resets Telegram's rolling window rate-limits and mimics a human taking a break.
 * **No Quotation Marks (`drop_author=True`):**
@@ -222,7 +238,7 @@ To ensure your Telegram account is **100% safe from bans, spam flags, and FloodW
 
 ---
 
-## 🧠 7. Forward Lock Monitor & Brain Storage
+## 🧠 9. Forward Lock Monitor & Brain Storage
 
 ### Automatic Forward Lock Detection
 * If the source channel owner has *"Restrict saving content"* turned ON, direct forwarding is blocked by Telegram.
@@ -230,5 +246,5 @@ To ensure your Telegram account is **100% safe from bans, spam flags, and FloodW
 * If locked mid-run, it freezes safely without dropping messages, and automatically resumes the exact second the admin turns forwarding back ON.
 
 ### Saved Messages Cloud Brain Storage
-* Every batch, state change, and forwarded message ID is saved to a pinned message in your **Saved Messages** (`me`) tagged `#CLONER_BRAIN_STORAGE`.
-* If Render resets or restarts the container, the bot reads this pinned message on startup and recovers your configuration immediately.
+* The entire queue, current queue index, and forwarded message IDs are saved to a pinned message in your **Saved Messages** (`me`) tagged `#CLONER_BRAIN_STORAGE`.
+* If Render resets or restarts the container while you are sleeping, the bot reads this pinned message on startup and recovers your queue right where it left off.
