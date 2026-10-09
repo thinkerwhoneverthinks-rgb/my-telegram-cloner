@@ -162,6 +162,10 @@ async def load_brain_storage():
                         state["queue_index"] = recovered.get("queue_index", 0)
                     if not state.get("last_sent_ids") and recovered.get("last_sent_ids"):
                         state["last_sent_ids"] = recovered.get("last_sent_ids", [])
+                    if recovered.get("is_running") is not None:
+                        state["is_running"] = recovered.get("is_running")
+                    if recovered.get("active_task"):
+                        state["active_task"] = recovered.get("active_task")
                     logger.info("Successfully recovered state from Saved Messages brain storage.")
                 break
     except Exception as e:
@@ -799,8 +803,14 @@ async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids,
 
     if sent_ids:
         state["last_sent_ids"].extend(sent_ids)
+        highest_id = max(batch_ids)
         if state.get("active_task"):
             state["active_task"]["batches_done"] = state["active_task"].get("batches_done", 0) + 1
+            state["active_task"]["last_src_id"] = highest_id
+            state["active_task"]["start_id"] = highest_id + 1
+        if state.get("queue") and state.get("queue_index", 0) < len(state["queue"]):
+            state["queue"][state["queue_index"]]["start_id"] = highest_id + 1
+            state["queue"][state["queue_index"]]["last_src_id"] = highest_id
         state["batches_since_breather"] += 1
         save_local_config()
         await sync_brain_storage()
@@ -876,6 +886,25 @@ async def main():
     await client.start()
     await load_brain_storage()
     logger.info("Bot started successfully. Listening for commands...")
+
+    # Auto-resume interrupted queue after cloud container reboot
+    if state.get("is_running") and state.get("dest_link") and state.get("queue") and state.get("queue_index", 0) < len(state.get("queue", [])):
+        q_idx = state.get("queue_index", 0)
+        curr_task = state["queue"][q_idx]
+        logger.info(f"🔄 Cloud container reboot detected! Auto-resuming queue from Task {q_idx + 1} ('{curr_task.get('title')}') at start_id={curr_task.get('start_id')}...")
+        try:
+            dest_chat, _, _, _, _, _ = parse_telegram_link(state["dest_link"])
+            dest_entity = await client.get_entity(dest_chat)
+            status_msg = await client.send_message(
+                'me',
+                f"🔄 **Cloud Reboot Detected & Recovered!**\n\n"
+                f"Auto-resuming task `{q_idx + 1}/{len(state['queue'])}`: *\"{curr_task.get('title')}\"*\n"
+                f"Continuing from Message ID: `{curr_task.get('start_id') or 'start'}` without duplicating messages."
+            )
+            asyncio.create_task(run_queue_pipeline(dest_entity, status_msg))
+        except Exception as e:
+            logger.error(f"Error auto-resuming queue pipeline after reboot: {e}")
+
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
