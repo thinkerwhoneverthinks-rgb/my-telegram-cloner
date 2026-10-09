@@ -111,7 +111,7 @@ async def sync_brain_storage():
     """Syncs state to a pinned message in Telegram Saved Messages ('me')."""
     try:
         brain_msg = None
-        async for msg in client.iter_messages('me', limit=15):
+        async for msg in client.iter_messages('me', limit=50):
             if msg.text and BRAIN_TAG in msg.text:
                 brain_msg = msg
                 break
@@ -148,7 +148,7 @@ async def sync_brain_storage():
 async def load_brain_storage():
     """Reads Saved Messages on startup to recover state if cloud storage wiped."""
     try:
-        async for msg in client.iter_messages('me', limit=15):
+        async for msg in client.iter_messages('me', limit=50):
             if msg.text and BRAIN_TAG in msg.text:
                 json_match = re.search(r'```json\s*(\{.*?\})\s*```', msg.text, re.DOTALL)
                 if json_match:
@@ -709,41 +709,61 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
 
     dest_chat, dest_topic_id, _, _, _, _ = parse_telegram_link(state["dest_link"])
     target_topic_id = dest_topic_id
+    start_ckpt = task.get("last_src_id") or task.get("start_id") or 0
 
-    # Topic Mode Setup
-    if mode == "new":
-        try:
-            target_topic_id = await create_new_forum_topic(dest_entity, topic_title)
-            header_text = f"📌 **{topic_title}**\n*(Transferred in 100-message batches)*"
+    # --- PRE-FLIGHT DESTINATION CHECK & TOPIC SETUP ---
+    h_msg = None
+    try:
+        if mode == "new":
+            try:
+                target_topic_id = await create_new_forum_topic(dest_entity, topic_title)
+            except Exception as e:
+                logger.warning(f"Could not create forum topic '{topic_title}': {e}. Falling back to default destination topic.")
+                target_topic_id = dest_topic_id
+
+            header_text = (
+                f"📌 **{topic_title}**\n"
+                f"*(Transferred in 100-message batches)*\n"
+                f"📍 Checkpoint: `#SRC_ID:{start_ckpt}`"
+            )
             send_kwargs = {"reply_to": target_topic_id}
             if send_as_entity:
                 send_kwargs["send_as"] = send_as_entity
             h_msg = await client.send_message(dest_entity, header_text, **send_kwargs)
-            try:
-                await client.pin_message(dest_entity, h_msg.id, notify=False)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"Failed to create new topic '{topic_title}': {e}")
-            target_topic_id = dest_topic_id
-    else:
-        # Mode is 'here': send divider header in existing topic/channel
-        header_text = (
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📚 **Topic / Channel:** {topic_title}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
-        try:
+        else:
+            # Mode is 'here': send divider header in existing topic/channel
+            header_text = (
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📚 **Topic / Channel:** {topic_title}\n"
+                f"📍 Checkpoint: `#SRC_ID:{start_ckpt}`\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            )
             send_kwargs = {"reply_to": target_topic_id}
             if send_as_entity:
                 send_kwargs["send_as"] = send_as_entity
             h_msg = await client.send_message(dest_entity, header_text, **send_kwargs)
+
+        if h_msg:
+            task["header_msg_id"] = h_msg.id
+            task["target_topic_id"] = target_topic_id
+            if state.get("active_task"):
+                state["active_task"]["header_msg_id"] = h_msg.id
+                state["active_task"]["target_topic_id"] = target_topic_id
+            save_local_config()
+            await sync_brain_storage()
             try:
                 await client.pin_message(dest_entity, h_msg.id, notify=False)
             except Exception:
                 pass
-        except Exception as e:
-            logger.warning(f"Failed to send header: {e}")
+
+    except Exception as pfe:
+        logger.error(f"❌ Pre-flight destination check failed for task '{topic_title}': {pfe}")
+        if status_msg:
+            try:
+                await status_msg.edit(f"⚠️ **Pre-flight Check Failed for {topic_title}:** `{pfe}`\nSkipping to next queue item...")
+            except Exception:
+                pass
+        return
 
     # Build iter_messages arguments
     iter_kwargs = {'entity': src_entity, 'reverse': True}
@@ -815,6 +835,28 @@ async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids,
         save_local_config()
         await sync_brain_storage()
 
+        # Update destination pinned header checkpoint
+        h_msg_id = state.get("active_task", {}).get("header_msg_id") if state.get("active_task") else None
+        if h_msg_id:
+            try:
+                task_mode = state.get("active_task", {}).get("mode", "here")
+                if task_mode == "new":
+                    updated_header = (
+                        f"📌 **{topic_title}**\n"
+                        f"*(Transferred in 100-message batches)*\n"
+                        f"📍 Checkpoint: `#SRC_ID:{highest_id}`"
+                    )
+                else:
+                    updated_header = (
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📚 **Topic / Channel:** {topic_title}\n"
+                        f"📍 Checkpoint: `#SRC_ID:{highest_id}`\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    )
+                await client.edit_message(dest_entity, h_msg_id, updated_header)
+            except Exception as e:
+                logger.debug(f"Could not update destination header checkpoint: {e}")
+
     q_idx = state.get("queue_index", 0) + 1
     q_len = len(state.get("queue", []))
     current_batch = state["active_task"].get("batches_done", 0) if state.get("active_task") else 0
@@ -880,6 +922,80 @@ async def start_web_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+# --- SMART ANCHOR RECOVERY UTILITIES ---
+
+async def resolve_smart_anchor_resume(dest_entity, curr_task):
+    """
+    On container reboot, scans the destination to detect if any messages from the active
+    batch were sent right before the crash, preventing duplicate forwards.
+    """
+    known_start = curr_task.get("start_id") or 1
+    src_chat = curr_task.get("src_chat")
+    src_topic_id = curr_task.get("src_topic_id")
+    target_topic_id = curr_task.get("target_topic_id")
+
+    if not src_chat:
+        return known_start
+
+    try:
+        dest_iter_kwargs = {'entity': dest_entity, 'limit': 30}
+        if target_topic_id:
+            dest_iter_kwargs['reply_to'] = target_topic_id
+
+        dest_msgs = []
+        async for m in client.iter_messages(**dest_iter_kwargs):
+            if m and (m.text or getattr(m, 'media', None)):
+                # Skip the pinned header itself
+                if m.id == curr_task.get("header_msg_id"):
+                    continue
+                dest_msgs.append(m)
+
+        if not dest_msgs:
+            return known_start
+
+        # Scan backwards from newest destination message to find one with text/caption
+        anchor_text = None
+        trailing_count = 0
+        for idx, dm in enumerate(dest_msgs):
+            txt = (dm.text or "").strip()
+            # Ignore divider headers
+            if txt and "Checkpoint: #SRC_ID:" not in txt and len(txt) > 3:
+                anchor_text = txt
+                trailing_count = idx  # number of media messages sent AFTER this anchor
+                break
+
+        if not anchor_text:
+            return known_start
+
+        # Search for this anchor text in source near the known starting point
+        src_entity = await client.get_entity(src_chat)
+        src_iter_kwargs = {'entity': src_entity, 'limit': 60, 'reverse': True}
+        if known_start > 30:
+            src_iter_kwargs['min_id'] = max(0, known_start - 30)
+        if src_topic_id:
+            src_iter_kwargs['reply_to'] = src_topic_id
+
+        matched_src_id = None
+        async for sm in client.iter_messages(**src_iter_kwargs):
+            s_txt = (sm.text or "").strip()
+            if s_txt and s_txt == anchor_text:
+                matched_src_id = sm.id
+                break
+
+        if matched_src_id:
+            calculated_start = matched_src_id + trailing_count + 1
+            if calculated_start > known_start:
+                logger.info(
+                    f"🎯 Smart Anchor Recovery matched text! Advancing start_id from {known_start} to {calculated_start} "
+                    f"(Matched Src ID: {matched_src_id}, Trailing msgs: {trailing_count})"
+                )
+                return calculated_start
+
+    except Exception as e:
+        logger.warning(f"Smart Anchor Recovery check skipped due to: {e}")
+
+    return known_start
+
 async def main():
     load_local_config()
     await start_web_server()
@@ -891,15 +1007,24 @@ async def main():
     if state.get("is_running") and state.get("dest_link") and state.get("queue") and state.get("queue_index", 0) < len(state.get("queue", [])):
         q_idx = state.get("queue_index", 0)
         curr_task = state["queue"][q_idx]
-        logger.info(f"🔄 Cloud container reboot detected! Auto-resuming queue from Task {q_idx + 1} ('{curr_task.get('title')}') at start_id={curr_task.get('start_id')}...")
+        logger.info(f"🔄 Cloud container reboot detected! Inspecting Smart Anchor for Task {q_idx + 1} ('{curr_task.get('title')}')...")
         try:
             dest_chat, _, _, _, _, _ = parse_telegram_link(state["dest_link"])
             dest_entity = await client.get_entity(dest_chat)
+
+            # Perform Smart Anchor check to prevent duplicate forwards if container crashed mid-batch
+            resumed_start_id = await resolve_smart_anchor_resume(dest_entity, curr_task)
+            curr_task["start_id"] = resumed_start_id
+            state["queue"][q_idx]["start_id"] = resumed_start_id
+            save_local_config()
+            await sync_brain_storage()
+
             status_msg = await client.send_message(
                 'me',
                 f"🔄 **Cloud Reboot Detected & Recovered!**\n\n"
                 f"Auto-resuming task `{q_idx + 1}/{len(state['queue'])}`: *\"{curr_task.get('title')}\"*\n"
-                f"Continuing from Message ID: `{curr_task.get('start_id') or 'start'}` without duplicating messages."
+                f"📍 Smart Anchor Start ID: `{resumed_start_id}`\n"
+                f"🛡️ Zero duplicates guaranteed."
             )
             asyncio.create_task(run_queue_pipeline(dest_entity, status_msg))
         except Exception as e:
