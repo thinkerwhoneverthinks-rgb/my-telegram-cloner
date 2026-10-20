@@ -231,7 +231,7 @@ def parse_telegram_link(link):
         val = int(seg1)
         topic_id = val
         start_id = val
-        has_explicit_topic = True
+        has_explicit_topic = False
 
     return chat_id, topic_id, start_id, end_id, is_range, has_explicit_topic
 
@@ -623,7 +623,7 @@ async def clone_handler(event):
 
         # Check if the link is a whole forum group (no explicit topic specified)
         is_forum = getattr(src_entity, 'forum', False)
-        if is_forum and not has_explicit_topic:
+        if is_forum and not has_explicit_topic and not start_id:
             # Whole group topic auto-discovery!
             await status_msg.edit(f"📂 **Forum group detected!** Auto-discovering all topics in *\"{getattr(src_entity, 'title', link)}\"*...")
             topics = await fetch_all_group_topics(src_entity)
@@ -643,19 +643,37 @@ async def clone_handler(event):
                 continue
 
         # Single topic, single channel, or explicit range
+        final_topic_id = None
+        final_start_id = start_id
+
+        if is_forum:
+            if has_explicit_topic:
+                # 3 segments: /c/chat/topic/message -> topic is seg1, start is seg2
+                final_topic_id = src_topic_id
+                final_start_id = start_id
+            elif src_topic_id:
+                # 2 segments in a forum: /c/chat/topic -> clone whole topic
+                final_topic_id = src_topic_id
+                final_start_id = None
+        else:
+            # Regular channel or non-forum group: NO TOPICS EXIST!
+            # Single segment is a message ID (start_id), never a topic ID
+            final_topic_id = None
+            final_start_id = start_id
+
         topic_title = None
-        if src_topic_id:
-            topic_title = await get_topic_title(src_entity, src_topic_id)
+        if final_topic_id and final_topic_id > 1:
+            topic_title = await get_topic_title(src_entity, final_topic_id)
         if not topic_title:
-            topic_title = getattr(src_entity, 'title', None) or f"Topic_{src_topic_id or 'Transfer'}"
+            topic_title = getattr(src_entity, 'title', None) or f"Topic_{final_topic_id or 'Transfer'}"
 
         mode = forced_mode or ("here" if dest_has_topic else "new")
         new_queue.append({
             "title": topic_title,
             "source_link": link,
             "src_chat": src_chat,
-            "src_topic_id": src_topic_id if has_explicit_topic else None,
-            "start_id": start_id,
+            "src_topic_id": final_topic_id,
+            "start_id": final_start_id,
             "end_id": end_id,
             "is_range": is_range,
             "mode": mode
@@ -801,12 +819,28 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
     elif task["start_id"]:
         iter_kwargs['min_id'] = task["start_id"] - 1
 
-    if src_topic_id:
+    if src_topic_id and src_topic_id > 1:
         iter_kwargs['reply_to'] = src_topic_id
 
     batch_buffer = []
 
-    async for message in client.iter_messages(**iter_kwargs):
+    async def message_stream():
+        try:
+            async for m in client.iter_messages(**iter_kwargs):
+                yield m
+        except (errors.rpcerrorlist.MsgIdInvalidError, errors.MsgIdInvalidError) as e:
+            if 'reply_to' in iter_kwargs:
+                logger.warning(
+                    f"GetRepliesRequest failed for topic {iter_kwargs['reply_to']}: {e}. "
+                    "Falling back to direct message iteration..."
+                )
+                del iter_kwargs['reply_to']
+                async for m in client.iter_messages(**iter_kwargs):
+                    yield m
+            else:
+                raise
+
+    async for message in message_stream():
         while state.get("is_paused"):
             await status_msg.edit(f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"* (ID: `{message.id}`).")
             await asyncio.sleep(2)
@@ -1000,15 +1034,24 @@ async def resolve_smart_anchor_resume(dest_entity, curr_task):
         src_iter_kwargs = {'entity': src_entity, 'limit': 60, 'reverse': True}
         if known_start > 30:
             src_iter_kwargs['min_id'] = max(0, known_start - 30)
-        if src_topic_id:
+        if src_topic_id and src_topic_id > 1:
             src_iter_kwargs['reply_to'] = src_topic_id
 
         matched_src_id = None
-        async for sm in client.iter_messages(**src_iter_kwargs):
-            s_txt = (sm.text or "").strip()
-            if s_txt and s_txt == anchor_text:
-                matched_src_id = sm.id
-                break
+        try:
+            async for sm in client.iter_messages(**src_iter_kwargs):
+                s_txt = (sm.text or "").strip()
+                if s_txt and s_txt == anchor_text:
+                    matched_src_id = sm.id
+                    break
+        except (errors.rpcerrorlist.MsgIdInvalidError, errors.MsgIdInvalidError):
+            if 'reply_to' in src_iter_kwargs:
+                del src_iter_kwargs['reply_to']
+                async for sm in client.iter_messages(**src_iter_kwargs):
+                    s_txt = (sm.text or "").strip()
+                    if s_txt and s_txt == anchor_text:
+                        matched_src_id = sm.id
+                        break
 
         if matched_src_id:
             calculated_start = matched_src_id + trailing_count + 1
