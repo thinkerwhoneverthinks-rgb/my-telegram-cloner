@@ -7,11 +7,18 @@ import random
 from datetime import datetime
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import (
-    GetForumTopicsByIDRequest,
-    GetForumTopicsRequest
-)
-from telethon.tl.functions.messages import CreateForumTopicRequest
+from telethon import functions
+
+def _resolve_tl_request(name):
+    # Telegram schema places forum topic requests under messages or channels depending on layer
+    for mod in (getattr(functions, 'messages', None), getattr(functions, 'channels', None)):
+        if mod and hasattr(mod, name):
+            return getattr(mod, name)
+    return None
+
+CreateForumTopicRequest = _resolve_tl_request('CreateForumTopicRequest')
+GetForumTopicsByIDRequest = _resolve_tl_request('GetForumTopicsByIDRequest')
+GetForumTopicsRequest = _resolve_tl_request('GetForumTopicsRequest')
 from telethon.tl.types import MessageActionTopicCreate
 from aiohttp import web
 
@@ -232,12 +239,16 @@ async def get_topic_title(chat_entity, topic_id):
     """Retrieves title of a forum topic."""
     if not topic_id:
         return None
-    try:
-        res = await client(GetForumTopicsByIDRequest(channel=chat_entity, topics=[topic_id]))
-        if res and hasattr(res, 'topics') and res.topics:
-            return res.topics[0].title
-    except Exception:
-        pass
+    if GetForumTopicsByIDRequest:
+        try:
+            try:
+                res = await client(GetForumTopicsByIDRequest(peer=chat_entity, topics=[topic_id]))
+            except TypeError:
+                res = await client(GetForumTopicsByIDRequest(channel=chat_entity, topics=[topic_id]))
+            if res and hasattr(res, 'topics') and res.topics:
+                return res.topics[0].title
+        except Exception:
+            pass
 
     try:
         topic_msg = await client.get_messages(chat_entity, ids=topic_id)
@@ -254,14 +265,25 @@ async def fetch_all_group_topics(chat_entity):
     Returns list of dicts: [{'topic_id': ..., 'title': ...}]
     """
     topics_list = []
+    if not GetForumTopicsRequest:
+        return topics_list
     try:
-        res = await client(GetForumTopicsRequest(
-            channel=chat_entity,
-            offset_date=0,
-            offset_id=0,
-            offset_topic=0,
-            limit=100
-        ))
+        try:
+            res = await client(GetForumTopicsRequest(
+                peer=chat_entity,
+                offset_date=0,
+                offset_id=0,
+                offset_topic=0,
+                limit=100
+            ))
+        except TypeError:
+            res = await client(GetForumTopicsRequest(
+                channel=chat_entity,
+                offset_date=0,
+                offset_id=0,
+                offset_topic=0,
+                limit=100
+            ))
         if res and hasattr(res, 'topics'):
             for t in res.topics:
                 topics_list.append({
@@ -274,6 +296,9 @@ async def fetch_all_group_topics(chat_entity):
 
 async def create_new_forum_topic(dest_entity, title):
     """Creates a new forum topic in destination group."""
+    if not CreateForumTopicRequest:
+        logger.error("CreateForumTopicRequest is not supported in this Telethon version.")
+        return None
     try:
         try:
             res = await client(CreateForumTopicRequest(peer=dest_entity, title=title))
