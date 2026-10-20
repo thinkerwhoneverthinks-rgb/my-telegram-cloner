@@ -8,10 +8,10 @@ from datetime import datetime
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import (
-    CreateForumTopicRequest,
     GetForumTopicsByIDRequest,
     GetForumTopicsRequest
 )
+from telethon.tl.functions.messages import CreateForumTopicRequest
 from telethon.tl.types import MessageActionTopicCreate
 from aiohttp import web
 
@@ -275,7 +275,10 @@ async def fetch_all_group_topics(chat_entity):
 async def create_new_forum_topic(dest_entity, title):
     """Creates a new forum topic in destination group."""
     try:
-        res = await client(CreateForumTopicRequest(channel=dest_entity, title=title))
+        try:
+            res = await client(CreateForumTopicRequest(peer=dest_entity, title=title))
+        except TypeError:
+            res = await client(CreateForumTopicRequest(channel=dest_entity, title=title))
         for update in getattr(res, 'updates', []):
             if hasattr(update, 'message'):
                 return update.message.id
