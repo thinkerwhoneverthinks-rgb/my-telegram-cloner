@@ -344,6 +344,41 @@ async def get_topic_title(chat_entity, topic_id):
 
     return None
 
+async def detect_topic_or_forum(src_entity, potential_topic_id=None):
+    """
+    Accurately determines if src_entity is a forum supergroup and whether potential_topic_id is a valid topic.
+    Returns (is_forum: bool, topic_title: Optional[str]).
+    """
+    is_forum = getattr(src_entity, 'forum', False)
+
+    # 1. If potential_topic_id provided, check if it has a topic title or topic create action
+    if potential_topic_id and potential_topic_id > 1:
+        title = await get_topic_title(src_entity, potential_topic_id)
+        if title:
+            return True, title
+
+    # 2. If entity doesn't have forum flag in memory/cache, refresh full channel info
+    if not is_forum:
+        try:
+            full = await client(functions.channels.GetFullChannelRequest(channel=src_entity))
+            for c in getattr(full, 'chats', []):
+                if c.id == getattr(src_entity, 'id', None):
+                    if getattr(c, 'forum', False):
+                        is_forum = True
+                        src_entity.forum = True
+                        break
+        except Exception:
+            pass
+
+    # 3. If forum flag is true, try to get title for potential_topic_id if not yet retrieved
+    title = None
+    if is_forum and potential_topic_id and potential_topic_id > 1:
+        title = await get_topic_title(src_entity, potential_topic_id)
+        if not title:
+            title = f"Topic #{potential_topic_id}"
+
+    return is_forum, title
+
 async def fetch_all_group_topics(chat_entity):
     """
     If a chat is a forum supergroup, fetches all topics inside it.
@@ -719,19 +754,22 @@ async def fromto_handler(event):
             await event.reply(f"❌ Error resolving source `{link1}`: `{e}`")
             return
 
-        topic_title = None
-        if t1 and t1 > 1:
+        is_f, detected_title = await detect_topic_or_forum(src_entity, t1 if not h1 else None)
+        topic_title = detected_title
+        if not topic_title and t1 and t1 > 1:
             topic_title = await get_topic_title(src_entity, t1)
         if not topic_title:
             topic_title = src_title
 
         mode = "here" if dest_has_topic else "new"
+        src_top = t1 if (h1 or is_f) else None
+        final_s1 = None if (is_f and not h1 and t1) else s1
         task = {
             "title": topic_title,
             "source_link": link1,
             "src_chat": c1,
-            "src_topic_id": t1 if h1 else None,
-            "start_id": s1,
+            "src_topic_id": src_top,
+            "start_id": final_s1,
             "end_id": e1,
             "is_range": r1,
             "mode": mode,
@@ -995,8 +1033,10 @@ async def clone_handler(event):
                 logger.error(f"Error resolving {link}: {e}")
                 continue
 
-            # Check if the link is a whole forum group (no explicit topic specified)
-            is_forum = getattr(src_entity, 'forum', False)
+            # Check if the link is a forum group or topic
+            potential_topic = src_topic_id if not has_explicit_topic else None
+            is_forum, detected_title = await detect_topic_or_forum(src_entity, potential_topic)
+
             if is_forum and not has_explicit_topic and not start_id:
                 # Whole group topic auto-discovery!
                 await status_msg.edit(f"📂 **Forum group detected!** Auto-discovering all topics in *\"{getattr(src_entity, 'title', link)}\"*...")
@@ -1035,8 +1075,8 @@ async def clone_handler(event):
                 final_topic_id = None
                 final_start_id = start_id
 
-            topic_title = None
-            if final_topic_id and final_topic_id > 1:
+            topic_title = detected_title
+            if not topic_title and final_topic_id and final_topic_id > 1:
                 topic_title = await get_topic_title(src_entity, final_topic_id)
             if not topic_title:
                 topic_title = getattr(src_entity, 'title', None) or f"Topic_{final_topic_id or 'Transfer'}"
@@ -1119,6 +1159,135 @@ async def run_queue_pipeline(dest_entity, status_msg):
         save_local_config()
         await sync_brain_storage()
 
+async def collect_task_message_ids(src_entity, task, status_msg=None):
+    """
+    Collects all matching message IDs for a task in chronological order.
+    NEVER uses reverse=True in iter_messages to avoid MTProto GetRepliesRequest/GetHistoryRequest
+    offset_id/add_offset bugs that return 0 messages.
+    """
+    src_topic_id = task.get("src_topic_id")
+    start_id = task.get("start_id")
+    end_id = task.get("end_id")
+    is_range = task.get("is_range", False)
+    title = task.get("title", "Task")
+    start_ckpt = task.get("last_src_id") or 0
+
+    msg_ids = []
+
+    # Check if start_id is actually a topic creation message if src_topic_id is not yet set
+    if not src_topic_id and start_id:
+        try:
+            chk_msg = await client.get_messages(src_entity, ids=start_id)
+            if chk_msg and getattr(chk_msg, 'action', None) and isinstance(chk_msg.action, MessageActionTopicCreate):
+                src_topic_id = start_id
+                task["src_topic_id"] = start_id
+                start_id = None
+        except Exception:
+            pass
+
+    # CASE A: Forum Topic Task
+    if src_topic_id and src_topic_id > 1:
+        logger.info(f"Collecting messages for topic {src_topic_id} in {getattr(src_entity, 'id', src_entity)}...")
+        try:
+            async for m in client.iter_messages(src_entity, reply_to=src_topic_id):
+                if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                    continue
+                if not m.text and not getattr(m, 'media', None):
+                    continue
+                if start_ckpt and m.id <= start_ckpt:
+                    continue
+                if start_id and m.id < start_id:
+                    continue
+                if end_id and m.id > end_id:
+                    continue
+                msg_ids.append(m.id)
+        except Exception as e:
+            logger.warning(f"iter_messages with reply_to={src_topic_id} raised: {e}")
+
+        # Fallback topic scanner if 0 messages found via reply_to
+        if not msg_ids:
+            logger.info(f"reply_to query returned 0 messages. Running fallback topic scanner for topic {src_topic_id}...")
+            async for m in client.iter_messages(src_entity, limit=2500):
+                if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                    continue
+                if not m.text and not getattr(m, 'media', None):
+                    continue
+                rep = getattr(m, 'reply_to', None)
+                top_id = getattr(rep, 'reply_to_top_id', None) or getattr(rep, 'reply_to_msg_id', None)
+                if top_id == src_topic_id or m.id == src_topic_id:
+                    if start_ckpt and m.id <= start_ckpt:
+                        continue
+                    if start_id and m.id < start_id:
+                        continue
+                    if end_id and m.id > end_id:
+                        continue
+                    msg_ids.append(m.id)
+
+    # CASE B: Explicit Message Range (start_id to end_id)
+    elif is_range and start_id and end_id:
+        logger.info(f"Collecting messages for range {start_id} to {end_id}...")
+        diff = end_id - start_id + 1
+        if diff <= 250:
+            try:
+                msgs = await client.get_messages(src_entity, ids=list(range(start_id, end_id + 1)))
+                for m in msgs:
+                    if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                        continue
+                    if not m.text and not getattr(m, 'media', None):
+                        continue
+                    if start_ckpt and m.id <= start_ckpt:
+                        continue
+                    msg_ids.append(m.id)
+            except Exception as e:
+                logger.warning(f"get_messages by ID range failed: {e}")
+
+        if not msg_ids:
+            async for m in client.iter_messages(src_entity, min_id=start_id - 1, max_id=end_id + 1):
+                if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                    continue
+                if not m.text and not getattr(m, 'media', None):
+                    continue
+                if start_ckpt and m.id <= start_ckpt:
+                    continue
+                msg_ids.append(m.id)
+
+    # CASE C: From start_id onwards or single message
+    elif start_id:
+        logger.info(f"Collecting messages starting from ID {start_id}...")
+        try:
+            m = await client.get_messages(src_entity, ids=start_id)
+            if m and not getattr(m, '_empty', False) and not getattr(m, 'action', None):
+                if m.text or getattr(m, 'media', None):
+                    if not start_ckpt or m.id > start_ckpt:
+                        msg_ids.append(m.id)
+        except Exception:
+            pass
+
+        effective_min = max(start_id - 1, start_ckpt)
+        async for m in client.iter_messages(src_entity, min_id=effective_min):
+            if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                continue
+            if not m.text and not getattr(m, 'media', None):
+                continue
+            msg_ids.append(m.id)
+
+    # CASE D: Entire channel (no filters)
+    else:
+        logger.info(f"Collecting all messages from channel...")
+        iter_kwargs = {'entity': src_entity}
+        if start_ckpt:
+            iter_kwargs['min_id'] = start_ckpt
+        async for m in client.iter_messages(**iter_kwargs):
+            if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                continue
+            if not m.text and not getattr(m, 'media', None):
+                continue
+            msg_ids.append(m.id)
+
+    unique_ids = sorted(list(set(msg_ids)))
+    logger.info(f"Finished collecting: {len(unique_ids)} messages found for '{title}'.")
+    return unique_ids
+
 async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
     """Processes messages for a single topic or channel item."""
     src_chat = task["src_chat"]
@@ -1187,147 +1356,119 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
     except Exception as pfe:
         logger.warning(f"Pre-flight header setup warning for task '{topic_title}': {pfe}. Continuing forwarding...")
 
-    # Build iter_messages arguments
-    iter_kwargs = {'entity': src_entity, 'reverse': True}
-    if task["is_range"]:
-        iter_kwargs['min_id'] = task["start_id"] - 1
-        iter_kwargs['max_id'] = task["end_id"] + 1
-    elif task["start_id"]:
-        iter_kwargs['min_id'] = task["start_id"] - 1
-
-    if src_topic_id and src_topic_id > 1:
-        iter_kwargs['reply_to'] = src_topic_id
-
-    batch_buffer = []
-    batch_num = task.get("batches_done", 0) + 1
     q_idx = state.get("queue_index", 0) + 1
     q_len = len(state.get("queue", []))
     target_desc = f"Topic #{target_topic_id}" if target_topic_id else "Main"
 
-    # Announce start of batch
+    # Scan and collect messages
     await safe_edit_status(
         status_msg,
-        f"🚀 **Starting Batch #{batch_num} for *\"{topic_title}\"*...**\n\n"
+        f"🔍 **Scanning source for *\"{topic_title}\"*...**\n\n"
         f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
-        f"📦 Messages Collected: `0/{BATCH_SIZE}`\n"
-        f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
-        f"⚡ *Scanning source channel...*"
+        f"⚡ *Collecting messages in chronological order...*"
     )
 
-    async def message_stream():
-        try:
-            async for m in client.iter_messages(**iter_kwargs):
-                yield m
-        except (errors.rpcerrorlist.MsgIdInvalidError, errors.MsgIdInvalidError) as e:
-            if 'reply_to' in iter_kwargs:
-                logger.warning(
-                    f"GetRepliesRequest failed for topic {iter_kwargs['reply_to']}: {e}. "
-                    "Falling back to direct message iteration..."
-                )
-                del iter_kwargs['reply_to']
-                async for m in client.iter_messages(**iter_kwargs):
-                    yield m
-            else:
-                raise
+    msg_ids = await collect_task_message_ids(src_entity, task, status_msg)
+    if not msg_ids:
+        logger.warning(f"No messages found for task '{topic_title}'.")
+        await safe_edit_status(
+            status_msg,
+            f"⚠️ **Notice for *\"{topic_title}\"*:**\n\n"
+            f"No transferable messages were found in this topic/source (empty or filtered).\n"
+            f"Moving to next item in queue..."
+        )
+        return
 
-    async for message in message_stream():
-        while state.get("is_paused"):
-            await safe_edit_status(status_msg, f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"* (ID: `{message.id}`).")
-            await asyncio.sleep(2)
+    # Split into batches of BATCH_SIZE (100)
+    batches = [msg_ids[i:i + BATCH_SIZE] for i in range(0, len(msg_ids), BATCH_SIZE)]
+    total_batches = len(batches)
+    total_task_msgs = len(msg_ids)
+
+    logger.info(f"Task '{topic_title}': Found {total_task_msgs} messages. Sliced into {total_batches} batches.")
+
+    for b_idx, batch_ids in enumerate(batches, start=1):
+        if not state.get("is_running"):
+            break
+
+        # Check restriction
+        unlocked = await wait_until_unlocked(src_entity, status_msg)
+        if not unlocked:
+            return
+
+        # Announce start of batch
+        current_total_sent = len(state.get("last_sent_ids", []))
+        await safe_edit_status(
+            status_msg,
+            f"🚀 **Starting Batch #{b_idx}/{total_batches} for *\"{topic_title}\"*...**\n\n"
+            f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
+            f"📦 Batch Size: `{len(batch_ids)}` messages (`0/{len(batch_ids)}` sent)\n"
+            f"📊 Total Transferred: `{current_total_sent}` messages\n"
+            f"⚡ *Dispatching in 10-message chunks...*"
+        )
+
+        # Dispatch batch in chunks of 10 messages for real-time live progress
+        sub_chunk_size = 10
+        sub_chunks = [batch_ids[j:j + sub_chunk_size] for j in range(0, len(batch_ids), sub_chunk_size)]
+        batch_sent_ids = []
+
+        for sub_idx, sub_ids in enumerate(sub_chunks, start=1):
+            while state.get("is_paused"):
+                await safe_edit_status(status_msg, f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"*.")
+                await asyncio.sleep(2)
+                if not state.get("is_running"):
+                    return
+
             if not state.get("is_running"):
                 return
 
-        if not state.get("is_running"):
-            return
+            try:
+                sent = await forward_batch_clean(dest_entity, src_entity, sub_ids, target_topic_id, send_as_entity)
+            except errors.ChatForwardsRestrictedError:
+                logger.warning("ChatForwardsRestrictedError caught during chunk forward! Waiting 5 min...")
+                await wait_until_unlocked(src_entity, status_msg)
+                sent = await forward_batch_clean(dest_entity, src_entity, sub_ids, target_topic_id, send_as_entity)
 
-        if message is None or getattr(message, 'action', None) or getattr(message, '_empty', False):
-            continue
-        if not message.text and not getattr(message, 'media', None):
-            continue
+            if sent:
+                batch_sent_ids.extend(sent)
+                state["last_sent_ids"].extend(sent)
+                highest_id = max(sub_ids)
+                if state.get("active_task"):
+                    state["active_task"]["last_src_id"] = highest_id
+                    state["active_task"]["start_id"] = highest_id + 1
+                if state.get("queue") and state.get("queue_index", 0) < len(state["queue"]):
+                    state["queue"][state["queue_index"]]["start_id"] = highest_id + 1
+                    state["queue"][state["queue_index"]]["last_src_id"] = highest_id
+                save_local_config()
+                await sync_brain_storage()
 
-        batch_buffer.append(message.id)
-
-        # Update progress after every 10 messages collected!
-        if len(batch_buffer) % 10 == 0 and len(batch_buffer) < BATCH_SIZE:
+            # Live update after EVERY 10 messages!
+            progress_in_batch = len(batch_sent_ids)
+            total_sent_so_far = len(state.get("last_sent_ids", []))
             await safe_edit_status(
                 status_msg,
-                f"⏳ **Batch #{batch_num} in Progress...**\n\n"
+                f"⏳ **Batch #{b_idx}/{total_batches} in Progress...**\n\n"
                 f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
-                f"📦 Progress: `{len(batch_buffer)}/{BATCH_SIZE}` messages ready in batch\n"
-                f"🔍 Current Msg ID: `{message.id}`\n"
+                f"📦 Batch Progress: `{progress_in_batch}/{len(batch_ids)}` messages delivered\n"
                 f"🎯 Target: `{target_desc}`\n"
-                f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
-                f"⚡ *Working actively...*"
+                f"📊 Total Transferred: `{total_sent_so_far}` messages\n"
+                f"⚡ *Actively transferring (Chunk {sub_idx}/{len(sub_chunks)})...*"
             )
 
-        if len(batch_buffer) >= BATCH_SIZE:
-            await safe_edit_status(
-                status_msg,
-                f"📤 **Forwarding Batch #{batch_num} ({len(batch_buffer)} messages)...**\n\n"
-                f"📚 Active: *\"{topic_title}\"*\n"
-                f"🎯 Destination: `{target_desc}`\n"
-                f"🛡️ Mode: `drop_author=True`\n"
-                f"⏳ Dispatching to Telegram servers..."
-            )
-            await process_and_send_batch(
-                status_msg, dest_entity, src_entity, batch_buffer,
-                target_topic_id, topic_title, send_as_entity
-            )
-            batch_buffer = []
-            batch_num = task.get("batches_done", 0) + 1
-            if state.get("is_running"):
-                await safe_edit_status(
-                    status_msg,
-                    f"🚀 **Starting Batch #{batch_num} for *\"{topic_title}\"*...**\n\n"
-                    f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
-                    f"📦 Messages Collected: `0/{BATCH_SIZE}`\n"
-                    f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
-                    f"⚡ *Scanning source channel...*"
-                )
+            # 2 second pause between 10-message chunks for smooth delivery
+            if sub_idx < len(sub_chunks) and state.get("is_running"):
+                await asyncio.sleep(2.0)
 
-    if batch_buffer and state.get("is_running"):
-        await safe_edit_status(
-            status_msg,
-            f"📤 **Forwarding Final Batch #{batch_num} ({len(batch_buffer)} messages)...**\n\n"
-            f"📚 Active: *\"{topic_title}\"*\n"
-            f"🎯 Destination: `{target_desc}`\n"
-            f"🛡️ Mode: `drop_author=True`"
-        )
-        await process_and_send_batch(
-            status_msg, dest_entity, src_entity, batch_buffer,
-            target_topic_id, topic_title, send_as_entity
-        )
-
-async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids, target_topic_id, topic_title, send_as_entity):
-    """Handles restriction checks, batch forward dispatch, delay & breather pauses."""
-    unlocked = await wait_until_unlocked(src_entity, status_msg)
-    if not unlocked:
-        return
-
-    try:
-        sent_ids = await forward_batch_clean(dest_entity, src_entity, batch_ids, target_topic_id, send_as_entity)
-    except errors.ChatForwardsRestrictedError:
-        logger.warning("ChatForwardsRestrictedError caught! Entering 5 min wait...")
-        await wait_until_unlocked(src_entity, status_msg)
-        sent_ids = await forward_batch_clean(dest_entity, src_entity, batch_ids, target_topic_id, send_as_entity)
-
-    if sent_ids:
-        state["last_sent_ids"].extend(sent_ids)
-        highest_id = max(batch_ids)
+        # Batch completed!
         if state.get("active_task"):
             state["active_task"]["batches_done"] = state["active_task"].get("batches_done", 0) + 1
-            state["active_task"]["last_src_id"] = highest_id
-            state["active_task"]["start_id"] = highest_id + 1
-        if state.get("queue") and state.get("queue_index", 0) < len(state["queue"]):
-            state["queue"][state["queue_index"]]["start_id"] = highest_id + 1
-            state["queue"][state["queue_index"]]["last_src_id"] = highest_id
         state["batches_since_breather"] += 1
         save_local_config()
         await sync_brain_storage()
 
         # Update destination pinned header checkpoint
         h_msg_id = state.get("active_task", {}).get("header_msg_id") if state.get("active_task") else None
-        if h_msg_id:
+        if h_msg_id and batch_ids:
+            highest_id = max(batch_ids)
             try:
                 task_mode = state.get("active_task", {}).get("mode", "here")
                 if task_mode == "new":
@@ -1346,60 +1487,58 @@ async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids,
                 await client.edit_message(dest_entity, h_msg_id, updated_header)
             except Exception as e:
                 logger.debug(f"Could not update destination header checkpoint: {e}")
-    else:
-        logger.warning(f"Batch for '{topic_title}' returned no sent IDs.")
 
-    q_idx = state.get("queue_index", 0) + 1
-    q_len = len(state.get("queue", []))
-    current_batch = state["active_task"].get("batches_done", 0) if state.get("active_task") else 0
-    total_msgs = len(state["last_sent_ids"])
-    target_desc = f"Topic #{target_topic_id}" if target_topic_id else "Main"
+        # Check if this was the last batch of the task
+        if b_idx >= total_batches:
+            logger.info(f"All batches for '{topic_title}' completed!")
+            break
 
-    # Breather Check (Every 4 to 8 batches, sleep for 5 to 8 minutes)
-    if state["batches_since_breather"] >= state["next_breather_threshold"]:
-        breather_sleep = random.uniform(BREATHER_PAUSE_MIN, BREATHER_PAUSE_MAX)
-        breather_mins = round(breather_sleep / 60, 1)
-        logger.info(f"Taking a human breather sleep of {breather_mins} minutes...")
-        state["current_status"] = f"Taking human breather pause ({breather_mins} mins)"
-        save_local_config()
+        # Breather Check (Every 4 to 8 batches, sleep for 5 to 8 minutes)
+        if state["batches_since_breather"] >= state["next_breather_threshold"]:
+            breather_sleep = random.uniform(BREATHER_PAUSE_MIN, BREATHER_PAUSE_MAX)
+            breather_mins = round(breather_sleep / 60, 1)
+            logger.info(f"Taking a human breather sleep of {breather_mins} minutes...")
+            state["current_status"] = f"Taking human breather pause ({breather_mins} mins)"
+            save_local_config()
 
-        await safe_edit_status(
-            status_msg,
-            f"☕ **Human Breather Pause ({breather_mins} mins)...**\n\n"
-            f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
-            f"📦 Batches Done: `{current_batch}` | 📊 Total Transferred: `{total_msgs}`\n"
-            f"🎯 Target: `{target_desc}`\n"
-            f"🛡️ Mimicking natural human breaks (Zero account risk).\n"
-            f"⏳ Auto-resuming in {int(breather_sleep)}s..."
-        )
+            await safe_edit_status(
+                status_msg,
+                f"☕ **Human Breather Pause ({breather_mins} mins)...**\n\n"
+                f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
+                f"📦 Completed Batches: `{b_idx}/{total_batches}`\n"
+                f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
+                f"🎯 Target: `{target_desc}`\n"
+                f"🛡️ Mimicking natural human breaks (Zero account risk).\n"
+                f"⏳ Auto-resuming in {int(breather_sleep)}s..."
+            )
 
-        for _ in range(int(breather_sleep // 5)):
-            if not state.get("is_running") or state.get("is_paused"):
-                break
-            await asyncio.sleep(5)
+            for _ in range(int(breather_sleep // 5)):
+                if not state.get("is_running") or state.get("is_paused"):
+                    break
+                await asyncio.sleep(5)
 
-        state["batches_since_breather"] = 0
-        state["next_breather_threshold"] = random.randint(BREATHER_BATCHES_MIN, BREATHER_BATCHES_MAX)
-        state["current_status"] = f"Processing ({q_idx}/{q_len}) - {topic_title}"
-    else:
-        # Standard Batch Delay: 35 to 50 seconds
-        batch_delay = random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX)
-        logger.info(f"Sleeping {round(batch_delay, 1)}s before next batch...")
+            state["batches_since_breather"] = 0
+            state["next_breather_threshold"] = random.randint(BREATHER_BATCHES_MIN, BREATHER_BATCHES_MAX)
+            state["current_status"] = f"Processing ({q_idx}/{q_len}) - {topic_title}"
+        else:
+            # Standard Batch Delay: 35 to 50 seconds
+            batch_delay = random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX)
+            logger.info(f"Sleeping {round(batch_delay, 1)}s before next batch...")
 
-        await safe_edit_status(
-            status_msg,
-            f"✅ **Batch #{current_batch} Delivered!** (`{len(sent_ids) if sent_ids else 0}` messages sent)\n\n"
-            f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
-            f"🎯 Target: `{target_desc}`\n"
-            f"📊 Total Transferred: `{total_msgs}` messages\n"
-            f"☕ Breather in: `{state['next_breather_threshold'] - state['batches_since_breather']} batches`\n"
-            f"⏳ Cooldown delay: `{round(batch_delay, 1)}s` before next batch..."
-        )
+            await safe_edit_status(
+                status_msg,
+                f"✅ **Batch #{b_idx}/{total_batches} Delivered!** (`{len(batch_sent_ids)}` messages sent)\n\n"
+                f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
+                f"🎯 Target: `{target_desc}`\n"
+                f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
+                f"☕ Breather in: `{state['next_breather_threshold'] - state['batches_since_breather']} batches`\n"
+                f"⏳ Cooldown delay: `{round(batch_delay, 1)}s` before next batch..."
+            )
 
-        for _ in range(int(batch_delay // 2)):
-            if not state.get("is_running") or state.get("is_paused"):
-                break
-            await asyncio.sleep(2)
+            for _ in range(int(batch_delay // 2)):
+                if not state.get("is_running") or state.get("is_paused"):
+                    break
+                await asyncio.sleep(2)
 
 # --- DUMMY RENDER APP PING SERVER ---
 async def handle_health_check(request):
@@ -1461,7 +1600,7 @@ async def resolve_smart_anchor_resume(dest_entity, curr_task):
 
         # Search for this anchor text in source near the known starting point
         src_entity = await client.get_entity(src_chat)
-        src_iter_kwargs = {'entity': src_entity, 'limit': 60, 'reverse': True}
+        src_iter_kwargs = {'entity': src_entity, 'limit': 60}
         if known_start > 30:
             src_iter_kwargs['min_id'] = max(0, known_start - 30)
         if src_topic_id and src_topic_id > 1:
