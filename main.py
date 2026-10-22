@@ -180,16 +180,28 @@ async def load_brain_storage():
 
 # --- LINK PARSER & METADATA UTILITIES ---
 
+def normalize_chat_id(val):
+    """Ensures 9+ digit group IDs are formatted with the -100 supergroup prefix."""
+    if isinstance(val, (int, str)):
+        s_val = str(val).strip()
+        if s_val.lstrip('-').isdigit():
+            v = int(s_val)
+            s_abs = str(abs(v))
+            if len(s_abs) >= 9:
+                if not s_val.startswith('-100'):
+                    return int('-100' + s_abs)
+            return v
+    return val
+
 def parse_destination_link(dest):
     """
     Parses any Telegram link or chat/topic input into (chat_id, topic_id, None, None, False, has_topic).
     Supports:
-    - https://t.me/c/1234567890/55 (private forum group topic)
-    - https://t.me/c/1234567890/55/100 (message in topic 55)
-    - https://t.me/publicgroup/55 (public forum topic)
-    - https://t.me/c/1234567890 55 or -1001234567890 55 (space-separated chat and topic)
-    - https://t.me/c/1234567890?topic=55
-    - -1001234567890/55
+    - https://t.me/c/3992974528/6850
+    - https://t.me/c/3992974528 6850
+    - -1003992974528 6850 or 3992974528 6850
+    - -1003992974528/6850 or 3992974528/6850
+    - https://t.me/c/3992974528?topic=6850
     - Standard non-topic channel/group links (topic_id=None, has_topic=False)
     """
     if not dest:
@@ -216,16 +228,12 @@ def parse_destination_link(dest):
         seg1 = match.group(2)
         seg2 = match.group(3)
 
-        if 't.me/c/' in dest and not chat_raw.startswith('-100'):
-            try:
-                chat_id = int('-100' + chat_raw)
-            except ValueError:
-                chat_id = chat_raw
+        if 't.me/c/' in dest and not chat_raw.startswith('-100') and chat_raw.isdigit():
+            chat_id = int('-100' + chat_raw)
+        elif chat_raw.lstrip('-').isdigit():
+            chat_id = normalize_chat_id(chat_raw)
         else:
-            try:
-                chat_id = int(chat_raw)
-            except ValueError:
-                chat_id = chat_raw
+            chat_id = chat_raw
 
         topic_id = explicit_topic
         if topic_id is None:
@@ -235,10 +243,10 @@ def parse_destination_link(dest):
         has_topic = topic_id is not None
         return chat_id, topic_id, None, None, False, has_topic
 
-    # Raw chat ID with /topic_id: -100123456/55 or -100123456
+    # Raw chat ID with /topic_id: -100123456/55 or 123456/55
     raw_match = re.search(r'^(-?\d+)(?:/(\d+))?$', dest)
     if raw_match:
-        chat_id = int(raw_match.group(1))
+        chat_id = normalize_chat_id(raw_match.group(1))
         topic_id = explicit_topic or (int(raw_match.group(2)) if raw_match.group(2) else None)
         return chat_id, topic_id, None, None, False, topic_id is not None
 
@@ -246,12 +254,37 @@ def parse_destination_link(dest):
 
 def parse_telegram_link(link):
     """
-    Parses any Telegram link into (chat_id, topic_id, start_id, end_id, is_range, has_explicit_topic).
+    Parses any Telegram link or chat/topic input into:
+    (chat_id, topic_id, start_id, end_id, is_range, has_explicit_topic).
+    Supports:
+    - https://t.me/c/2200390931/899
+    - -1002200390931 899 or 2200390931 899
+    - -1002200390931/899 or 2200390931/899
+    - https://t.me/c/2200390931 899
+    - https://t.me/c/2200390931/899/10-50
+    - https://t.me/c/2200390931/10-50
     """
     if not link:
         return None, None, None, None, False, False
 
     link = link.strip()
+    explicit_topic = None
+
+    # 1. Check space format: '<link_or_chat> <topic_id>'
+    space_parts = link.split()
+    if len(space_parts) == 2 and space_parts[1].isdigit():
+        link = space_parts[0]
+        explicit_topic = int(space_parts[1])
+
+    # 2. Check raw format: -100123/456 or 123/456
+    raw_slash = re.match(r'^(-?\d+)(?:/(\d+))?$', link)
+    if raw_slash:
+        c_raw = raw_slash.group(1)
+        chat_id = normalize_chat_id(c_raw)
+        topic_id = explicit_topic or (int(raw_slash.group(2)) if raw_slash.group(2) else None)
+        return chat_id, topic_id, None, None, False, topic_id is not None
+
+    # 3. Check t.me link
     match = re.search(r't\.me/(?:c/)?([^/?#]+)(?:/(\d+(?:-\d+)?))?(?:/(\d+(?:-\d+)?))?', link)
     if not match:
         return None, None, None, None, False, False
@@ -260,22 +293,18 @@ def parse_telegram_link(link):
     seg1 = match.group(2)
     seg2 = match.group(3)
 
-    if 't.me/c/' in link and not chat_raw.startswith('-100'):
-        try:
-            chat_id = int('-100' + chat_raw)
-        except ValueError:
-            chat_id = chat_raw
+    if 't.me/c/' in link and not chat_raw.startswith('-100') and chat_raw.isdigit():
+        chat_id = int('-100' + chat_raw)
+    elif chat_raw.lstrip('-').isdigit():
+        chat_id = normalize_chat_id(chat_raw)
     else:
-        try:
-            chat_id = int(chat_raw)
-        except ValueError:
-            chat_id = chat_raw
+        chat_id = chat_raw
 
     is_range = False
     start_id = None
     end_id = None
-    topic_id = None
-    has_explicit_topic = False
+    topic_id = explicit_topic
+    has_explicit_topic = explicit_topic is not None
 
     if seg1 and '-' in seg1:
         is_range = True
@@ -293,11 +322,44 @@ def parse_telegram_link(link):
         start_id = int(seg2)
     elif seg1:
         val = int(seg1)
-        topic_id = val
-        start_id = val
-        has_explicit_topic = False
+        topic_id = explicit_topic or val
+        start_id = None
+        has_explicit_topic = True
 
     return chat_id, topic_id, start_id, end_id, is_range, has_explicit_topic
+
+def extract_clone_targets(raw_input):
+    """
+    Extracts individual source targets from user input.
+    Supports:
+    - https://t.me/c/2200390931/899
+    - https://t.me/c/2200390931 899
+    - -1002200390931 899 or 2200390931 899
+    - -1002200390931/899 or 2200390931/899
+    - Multiple targets separated by newlines or spaces.
+    """
+    if not raw_input:
+        return []
+    text = raw_input.strip()
+    words = text.split(None, 1)
+    if words and words[0].lower() in ['new', 'here']:
+        text = words[1].strip() if len(words) > 1 else ''
+    if not text:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    targets = []
+    for line in lines:
+        tokens = line.split()
+        i = 0
+        while i < len(tokens):
+            curr = tokens[i]
+            if i + 1 < len(tokens) and tokens[i + 1].isdigit():
+                targets.append(f"{curr} {tokens[i + 1]}")
+                i += 2
+            else:
+                targets.append(curr)
+                i += 1
+    return targets
 
 _last_status_edit_time = 0
 
@@ -507,6 +569,11 @@ async def forward_batch_clean(dest_entity, src_entity, batch_ids, dest_topic_id=
             }
             if dest_topic_id:
                 kwargs["top_msg_id"] = int(dest_topic_id)
+                try:
+                    from telethon.tl.types import InputReplyToMessage
+                    kwargs["reply_to"] = InputReplyToMessage(reply_to_msg_id=int(dest_topic_id), top_msg_id=int(dest_topic_id))
+                except Exception:
+                    pass
             if send_as_peer:
                 kwargs["send_as"] = send_as_peer
 
@@ -655,9 +722,15 @@ async def fromto_handler(event):
         )
         return
 
-    raw_links = re.findall(r'https?://t\.me/[^\s]+', raw_input)
+    raw_links = extract_clone_targets(raw_input)
     if len(raw_links) < 2:
-        await event.reply("❌ **Error:** Please provide both a FROM link and a TO link.")
+        await event.reply(
+            "❌ **Error:** Please provide both a FROM source and a TO destination/endpoint.\n\n"
+            "💡 **Examples:**\n"
+            "• `/fromto https://t.me/c/123/10 https://t.me/c/123/150`\n"
+            "• `/fromto -1002200390931 899 -1003992974528 6850`\n"
+            "• `/fromto 2200390931 899 3992974528 6850`"
+        )
         return
 
     link1, link2 = raw_links[0], raw_links[1]
@@ -665,7 +738,7 @@ async def fromto_handler(event):
     c2, t2, s2, e2, r2, h2 = parse_telegram_link(link2)
 
     if not c1 or not c2:
-        await event.reply("❌ Could not parse one or both Telegram links.")
+        await event.reply("❌ Could not parse one or both Telegram sources.")
         return
 
     # Check if both links belong to the same chat -> message range forwarding
@@ -939,13 +1012,13 @@ async def clone_handler(event):
 
     raw_input = event.pattern_match.group(1)
     if not raw_input:
-        await event.reply("⚠️ **Usage:** `/clone [new|here] <link1> <link2>...` or `/clone <from_link> to <to_link>`")
-        return
-
-    # Extract all Telegram links from the message
-    raw_links = re.findall(r'https?://t\.me/[^\s]+', raw_input)
-    if not raw_links:
-        await event.reply("❌ **Error:** No valid Telegram links detected in your message.")
+        await event.reply(
+            "⚠️ **Usage:**\n"
+            "• `/clone [new|here] <link1> <link2>...`\n"
+            "• `/clone -1002200390931 899` or `2200390931 899`\n"
+            "• `/clone -1002200390931/899`\n"
+            "• `/clone <from> to <to>` (sets destination & clones immediately)"
+        )
         return
 
     # Extract forced mode (new or here) if present
@@ -955,43 +1028,61 @@ async def clone_handler(event):
     if first_word in ['new', 'here']:
         forced_mode = first_word
 
-    has_to_keyword = bool(re.search(r'\bto\b', raw_input, re.IGNORECASE))
-    has_from_keyword = bool(re.search(r'\bfrom\b', raw_input, re.IGNORECASE))
+    cleaned_input = raw_input
 
-    # Check if this is a From-To link setup where link2 is destination
-    if len(raw_links) == 2 and (has_to_keyword or has_from_keyword):
-        c1, _, _, _, _, _ = parse_telegram_link(raw_links[0])
-        c2, _, _, _, _, _ = parse_telegram_link(raw_links[1])
-        if c1 and c2 and c1 != c2:
-            # Different chats with "to" or "from" keyword -> link2 is destination!
-            state["dest_link"] = raw_links[1]
-            save_local_config()
-            await sync_brain_storage()
-            raw_links = [raw_links[0]]
+    # Check if this is a From-To setup where the second part is destination
+    to_match = re.search(r'\s+to\s+', cleaned_input, re.IGNORECASE)
+    from_match = re.search(r'^\s*from\s+', cleaned_input, re.IGNORECASE)
+    if from_match:
+        cleaned_input = cleaned_input[from_match.end():].strip()
+
+    if to_match:
+        src_raw = cleaned_input[:to_match.start()].strip()
+        dest_raw = cleaned_input[to_match.end():].strip()
+        if src_raw and dest_raw:
+            d_chat, d_topic, _, _, _, d_has_topic = parse_destination_link(dest_raw)
+            if d_chat:
+                state["dest_link"] = dest_raw
+                save_local_config()
+                await sync_brain_storage()
+                cleaned_input = src_raw
+
+    # Extract targets (supports links, raw -100... chat IDs, space-separated topic IDs, and multi-line inputs)
+    raw_targets = extract_clone_targets(cleaned_input)
+    if not raw_targets:
+        await event.reply(
+            "❌ **Error:** No valid Telegram links or chat IDs detected in your message.\n\n"
+            "💡 **Accepted formats:**\n"
+            "• `https://t.me/c/2200390931/899`\n"
+            "• `-1002200390931 899` or `2200390931 899`\n"
+            "• `-1002200390931/899`\n"
+            "• `https://t.me/c/2200390931 899`"
+        )
+        return
 
     if not state.get("dest_link"):
-        await event.reply("❌ **Error:** Set destination first using `/setdest <link>` or use `/fromto <from> <to>`.")
+        await event.reply("❌ **Error:** Set destination first using `/setdest <link_or_chat> [topic_id]` or use `/clone <from> to <to>`.")
         return
 
     dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(state["dest_link"])
     if not dest_chat:
-        await event.reply("❌ **Error:** Destination link is invalid or unparseable.")
+        await event.reply("❌ **Error:** Destination link or chat ID is invalid.")
         return
 
     try:
         dest_entity = await client.get_entity(dest_chat)
     except Exception as e:
-        await event.reply(f"❌ Could not resolve destination: `{e}`")
+        await event.reply(f"❌ Could not resolve destination `{dest_chat}`: `{e}`")
         return
 
-    status_msg = await event.reply(f"🔍 **Analyzing provided link(s)...**")
+    status_msg = await event.reply(f"🔍 **Analyzing provided source(s)...**")
 
     new_queue = []
 
-    # Check if exactly 2 links from the same chat were provided -> pair as From-To range!
-    if len(raw_links) == 2:
-        c1, t1, s1, e1, r1, h1 = parse_telegram_link(raw_links[0])
-        c2, t2, s2, e2, r2, h2 = parse_telegram_link(raw_links[1])
+    # Check if exactly 2 targets from the same chat were provided -> pair as From-To range!
+    if len(raw_targets) == 2:
+        c1, t1, s1, e1, r1, h1 = parse_telegram_link(raw_targets[0])
+        c2, t2, s2, e2, r2, h2 = parse_telegram_link(raw_targets[1])
         if c1 and c2 and c1 == c2 and s1 and s2:
             start_val = min(s1, s2)
             end_val = max(s1, s2)
@@ -1008,7 +1099,7 @@ async def clone_handler(event):
                 mode = forced_mode or ("here" if dest_has_topic else "new")
                 new_queue.append({
                     "title": t_title,
-                    "source_link": f"{raw_links[0]} -> {raw_links[1]}",
+                    "source_link": f"{raw_targets[0]} -> {raw_targets[1]}",
                     "src_chat": c1,
                     "src_topic_id": tid,
                     "start_id": start_val,
@@ -1020,71 +1111,61 @@ async def clone_handler(event):
             except Exception as e:
                 logger.error(f"Error resolving link pair: {e}")
 
-    # If not paired as a 2-link range, process links individually
+    # If not paired as a 2-target range, process targets individually
     if not new_queue:
-        for link in raw_links:
-            src_chat, src_topic_id, start_id, end_id, is_range, has_explicit_topic = parse_telegram_link(link)
+        for target in raw_targets:
+            src_chat, src_topic_id, start_id, end_id, is_range, has_explicit_topic = parse_telegram_link(target)
             if not src_chat:
                 continue
 
             try:
                 src_entity = await client.get_entity(src_chat)
             except Exception as e:
-                logger.error(f"Error resolving {link}: {e}")
+                logger.error(f"Error resolving source {target}: {e}")
+                await safe_edit_status(status_msg, f"❌ Could not resolve source `{src_chat}`: `{e}`")
                 continue
 
-            # Check if the link is a forum group or topic
-            potential_topic = src_topic_id if not has_explicit_topic else None
-            is_forum, detected_title = await detect_topic_or_forum(src_entity, potential_topic)
+            # Check if this is a whole-group forum request (no topic, no start_id, no range)
+            if not src_topic_id and not start_id and not is_range:
+                is_forum, detected_title = await detect_topic_or_forum(src_entity, None)
+                if is_forum:
+                    await status_msg.edit(f"📂 **Forum group detected!** Auto-discovering all topics in *\"{getattr(src_entity, 'title', target)}\"*...")
+                    topics = await fetch_all_group_topics(src_entity)
+                    if topics:
+                        for t in topics:
+                            mode = forced_mode or ("here" if dest_has_topic else "new")
+                            new_queue.append({
+                                "title": t["title"],
+                                "source_link": f"https://t.me/c/{str(src_chat).replace('-100', '')}/{t['topic_id']}",
+                                "src_chat": src_chat,
+                                "src_topic_id": t["topic_id"],
+                                "start_id": None,
+                                "end_id": None,
+                                "is_range": False,
+                                "mode": mode,
+                                "target_topic_id": dest_topic_id
+                            })
+                        continue
 
-            if is_forum and not has_explicit_topic and not start_id:
-                # Whole group topic auto-discovery!
-                await status_msg.edit(f"📂 **Forum group detected!** Auto-discovering all topics in *\"{getattr(src_entity, 'title', link)}\"*...")
-                topics = await fetch_all_group_topics(src_entity)
-                if topics:
-                    for t in topics:
-                        mode = forced_mode or ("here" if dest_has_topic else "new")
-                        new_queue.append({
-                            "title": t["title"],
-                            "source_link": f"https://t.me/c/{str(src_chat).replace('-100', '')}/{t['topic_id']}",
-                            "src_chat": src_chat,
-                            "src_topic_id": t["topic_id"],
-                            "start_id": None,
-                            "end_id": None,
-                            "is_range": False,
-                            "mode": mode,
-                            "target_topic_id": dest_topic_id
-                        })
-                    continue
-
-            # Single topic, single channel, or explicit range
-            final_topic_id = None
+            # Single topic, single channel, or explicit range.
+            # PRESERVE src_topic_id! Never wipe it!
+            final_topic_id = src_topic_id
             final_start_id = start_id
 
-            if is_forum:
-                if has_explicit_topic:
-                    # 3 segments: /c/chat/topic/message -> topic is seg1, start is seg2
-                    final_topic_id = src_topic_id
-                    final_start_id = start_id
-                elif src_topic_id:
-                    # 2 segments in a forum: /c/chat/topic -> clone whole topic
-                    final_topic_id = src_topic_id
-                    final_start_id = None
-            else:
-                # Regular channel or non-forum group: NO TOPICS EXIST!
-                final_topic_id = None
-                final_start_id = start_id
-
-            topic_title = detected_title
-            if not topic_title and final_topic_id and final_topic_id > 1:
+            topic_title = None
+            if final_topic_id and final_topic_id > 1:
                 topic_title = await get_topic_title(src_entity, final_topic_id)
             if not topic_title:
-                topic_title = getattr(src_entity, 'title', None) or f"Topic_{final_topic_id or 'Transfer'}"
+                base_title = getattr(src_entity, 'title', None) or f"Chat_{src_chat}"
+                if final_topic_id:
+                    topic_title = f"{base_title} (Topic #{final_topic_id})"
+                else:
+                    topic_title = base_title
 
             mode = forced_mode or ("here" if dest_has_topic else "new")
             new_queue.append({
                 "title": topic_title,
-                "source_link": link,
+                "source_link": target,
                 "src_chat": src_chat,
                 "src_topic_id": final_topic_id,
                 "start_id": final_start_id,
@@ -1188,6 +1269,20 @@ async def collect_task_message_ids(src_entity, task, status_msg=None):
     # CASE A: Forum Topic Task
     if src_topic_id and src_topic_id > 1:
         logger.info(f"Collecting messages for topic {src_topic_id} in {getattr(src_entity, 'id', src_entity)}...")
+
+        # 1. Include root topic message if it has text or media
+        try:
+            root_m = await client.get_messages(src_entity, ids=src_topic_id)
+            if root_m and not getattr(root_m, '_empty', False) and not getattr(root_m, 'action', None):
+                if root_m.text or getattr(root_m, 'media', None):
+                    if not start_ckpt or root_m.id > start_ckpt:
+                        if not start_id or root_m.id >= start_id:
+                            if not end_id or root_m.id <= end_id:
+                                msg_ids.append(root_m.id)
+        except Exception:
+            pass
+
+        # 2. Iterate topic messages via reply_to=src_topic_id (MTProto messages.GetReplies)
         try:
             async for m in client.iter_messages(src_entity, reply_to=src_topic_id):
                 if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
@@ -1204,7 +1299,7 @@ async def collect_task_message_ids(src_entity, task, status_msg=None):
         except Exception as e:
             logger.warning(f"iter_messages with reply_to={src_topic_id} raised: {e}")
 
-        # Fallback topic scanner if 0 messages found via reply_to
+        # 3. Fallback thread scanner if 0 messages found via reply_to
         if not msg_ids:
             logger.info(f"reply_to query returned 0 messages. Running fallback topic scanner for topic {src_topic_id}...")
             async for m in client.iter_messages(src_entity, limit=2500):
@@ -1222,6 +1317,23 @@ async def collect_task_message_ids(src_entity, task, status_msg=None):
                     if end_id and m.id > end_id:
                         continue
                     msg_ids.append(m.id)
+
+        # 4. Fallback: Check if src_topic_id is actually a channel post
+        if not msg_ids:
+            logger.info(f"Topic queries returned 0 messages. Testing if {src_topic_id} is a channel message...")
+            try:
+                chk = await client.get_messages(src_entity, ids=src_topic_id)
+                if chk and not getattr(chk, '_empty', False) and (chk.text or getattr(chk, 'media', None)):
+                    logger.info(f"Found message {src_topic_id} in channel feed, collecting from this message onwards...")
+                    effective_min = max(src_topic_id - 1, start_ckpt)
+                    async for m in client.iter_messages(src_entity, min_id=effective_min):
+                        if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                            continue
+                        if not m.text and not getattr(m, 'media', None):
+                            continue
+                        msg_ids.append(m.id)
+            except Exception as e:
+                logger.warning(f"Channel message check failed: {e}")
 
     # CASE B: Explicit Message Range (start_id to end_id)
     elif is_range and start_id and end_id:
@@ -1374,7 +1486,9 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
         await safe_edit_status(
             status_msg,
             f"⚠️ **Notice for *\"{topic_title}\"*:**\n\n"
-            f"No transferable messages were found in this topic/source (empty or filtered).\n"
+            f"No transferable messages were found in this source.\n"
+            f"• Source Chat: `{src_chat}`\n"
+            f"• Target Topic/Msg ID: `{src_topic_id or task.get('start_id') or 'Entire Chat'}`\n\n"
             f"Moving to next item in queue..."
         )
         return
