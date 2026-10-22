@@ -167,6 +167,10 @@ All commands must be sent from your own Telegram account (outgoing messages):
 | **`/fromto <from> <to>`** | `/fromto https://t.me/c/123/10 https://t.me/c/123/150` | Forwards range from start link to end link (same chat) OR sets destination to link 2 and clones link 1! |
 | **`/range <from> <to>`** | `/range https://t.me/c/123/10 https://t.me/c/123/150` | Quick message range forwarder into destination topic. |
 | **`/clone [new\|here] <links>`** | `/clone here https://t.me/c/.../1 https://t.me/c/.../2` | **Queues 1 or many links** (or entire groups). Supports `<from> to <to>` syntax! |
+| **`/scan <source> [topic_id]`** | `/scan https://t.me/c/123/55` | Pre-scans source topic in MTProto, displays message counts and text post snippets. |
+| **`/pintext <all\|off>`** | `/pintext all` | Auto-pins forwarded pure text messages in destination (ignores photos/videos). |
+| **`/cleanheader <on\|off>`** | `/cleanheader on` | Auto-deletes checkpoint header message once all batches of a task finish. |
+| **`/app`** | `/app` | Displays your Telegram Mini App & Web Dashboard URL. |
 | **`/setsendas <link\|off>`** | `/setsendas @MyChannel` | Sets a channel to send as, or `off` for default (Anonymous Admin). |
 | **`/queue`** | `/queue` | Displays all pending and active items in the queue. |
 | **`/status`** | `/status` | Shows live progress, destination topic, active item, batch count, and delays. |
@@ -174,6 +178,19 @@ All commands must be sent from your own Telegram account (outgoing messages):
 | **`/resume`** | `/resume` | Unpauses and continues forwarding. |
 | **`/stop`** | `/stop` | Cancels the active task completely and clears queue. |
 | **`/purge`** | `/purge` | Bulk-deletes all messages forwarded in this/last task from destination in chunks of 100. |
+
+---
+
+## 📱 4.0 Telegram Mini App & Web Dashboard
+
+The userbot includes a built-in glassmorphic **Web Dashboard** and **Telegram Mini App**:
+* **URL:** Access directly at your Render domain (e.g. `https://my-app.onrender.com/app` or `http://localhost:8080`).
+* **Telegram Mini App Setup:** Use [@BotFather](https://t.me/BotFather) -> `/setmenubutton` -> Select your bot -> Enter your Render URL. You can then open the dashboard inside Telegram with one tap!
+* **Features:**
+  * **Interactive Source & Topic Scanner:** Enter any chat ID or topic and click **Scan & Analyze** to preview all text posts.
+  * **Text Pin Picker:** Choose **Don't Pin**, **Pin All Pure Text**, or use the checklist to select individual text posts to pin.
+  * **Auto-Delete Header Toggle:** Checkbox to automatically wipe checkpoint headers upon completion.
+  * **Live Control Deck:** Start, Pause, Resume, Stop, and Purge buttons with real-time streaming status.
 
 ---
 

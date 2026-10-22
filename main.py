@@ -21,6 +21,7 @@ GetForumTopicsByIDRequest = _resolve_tl_request('GetForumTopicsByIDRequest')
 GetForumTopicsRequest = _resolve_tl_request('GetForumTopicsRequest')
 from telethon.tl.types import MessageActionTopicCreate
 from aiohttp import web
+from webapp import get_webapp_html
 
 # --- CONFIGURATION FROM ENVIRONMENT VARIABLES ---
 API_ID_RAW = os.environ.get("API_ID")
@@ -73,7 +74,10 @@ state = {
     "active_task": None,
     "last_sent_ids": [],
     "batches_since_breather": 0,
-    "next_breather_threshold": random.randint(BREATHER_BATCHES_MIN, BREATHER_BATCHES_MAX)
+    "next_breather_threshold": random.randint(BREATHER_BATCHES_MIN, BREATHER_BATCHES_MAX),
+    "delete_header_on_finish": True,
+    "pin_text_mode": "none",
+    "pinned_ids": []
 }
 
 # --- PERSISTENCE & TELEGRAM "BRAIN STORAGE" ---
@@ -83,13 +87,17 @@ def get_serializable_state():
         "dest_link": state.get("dest_link"),
         "send_as_link": state.get("send_as_link"),
         "is_running": state.get("is_running"),
+        "is_paused": state.get("is_paused"),
         "current_status": state.get("current_status"),
         "queue_index": state.get("queue_index", 0),
         "queue_total": len(state.get("queue", [])),
         "queue": state.get("queue", []),
         "active_task": state.get("active_task"),
         "last_sent_ids": state.get("last_sent_ids", [])[-500:],
-        "total_sent_count": len(state.get("last_sent_ids", []))
+        "total_sent_count": len(state.get("last_sent_ids", [])),
+        "delete_header_on_finish": state.get("delete_header_on_finish", True),
+        "pin_text_mode": state.get("pin_text_mode", "none"),
+        "pinned_ids": state.get("pinned_ids", [])
     }
 
 def save_local_config():
@@ -110,6 +118,12 @@ def load_local_config():
                 state["queue_index"] = data.get("queue_index", 0)
                 state["active_task"] = data.get("active_task")
                 state["last_sent_ids"] = data.get("last_sent_ids", [])
+                if "delete_header_on_finish" in data:
+                    state["delete_header_on_finish"] = data["delete_header_on_finish"]
+                if "pin_text_mode" in data:
+                    state["pin_text_mode"] = data["pin_text_mode"]
+                if "pinned_ids" in data:
+                    state["pinned_ids"] = data["pinned_ids"]
                 logger.info("Local config loaded successfully.")
         except Exception as e:
             logger.error(f"Error loading local config: {e}")
@@ -496,6 +510,107 @@ async def create_new_forum_topic(dest_entity, title):
         raise
     return None
 
+async def analyze_source(src_chat, src_topic_id=None, start_id=None, end_id=None):
+    """
+    Scans source topic/channel messages to classify text vs media.
+    Returns counts and list of pure text posts with snippets.
+    """
+    src_entity = await client.get_entity(src_chat)
+    title = getattr(src_entity, 'title', str(src_chat))
+
+    total = 0
+    text_count = 0
+    media_count = 0
+    text_messages = []
+    all_ids = []
+
+    # Case 1: Forum topic
+    if src_topic_id and src_topic_id > 1:
+        # Check root message
+        try:
+            root_m = await client.get_messages(src_entity, ids=src_topic_id)
+            if root_m and not getattr(root_m, '_empty', False) and not getattr(root_m, 'action', None):
+                all_ids.append(root_m.id)
+                total += 1
+                if root_m.text and not getattr(root_m, 'media', None):
+                    text_count += 1
+                    text_messages.append({
+                        "id": root_m.id,
+                        "snippet": root_m.text[:140],
+                        "date": root_m.date.strftime('%Y-%m-%d %H:%M') if root_m.date else '',
+                        "length": len(root_m.text)
+                    })
+                elif getattr(root_m, 'media', None):
+                    media_count += 1
+        except Exception:
+            pass
+
+        try:
+            async for m in client.iter_messages(src_entity, reply_to=src_topic_id):
+                if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                    continue
+                if not m.text and not getattr(m, 'media', None):
+                    continue
+                if start_id and m.id < start_id:
+                    continue
+                if end_id and m.id > end_id:
+                    continue
+
+                all_ids.append(m.id)
+                total += 1
+                if m.text and not getattr(m, 'media', None):
+                    text_count += 1
+                    text_messages.append({
+                        "id": m.id,
+                        "snippet": m.text[:140],
+                        "date": m.date.strftime('%Y-%m-%d %H:%M') if root_m and root_m.date else (m.date.strftime('%Y-%m-%d %H:%M') if m.date else ''),
+                        "length": len(m.text)
+                    })
+                elif getattr(m, 'media', None):
+                    media_count += 1
+        except Exception as e:
+            logger.warning(f"analyze_source reply_to query error: {e}")
+
+    # Case 2: Range or Channel
+    else:
+        iter_kwargs = {'entity': src_entity}
+        if start_id and end_id:
+            iter_kwargs['min_id'] = start_id - 1
+            iter_kwargs['max_id'] = end_id + 1
+        elif start_id:
+            iter_kwargs['min_id'] = start_id - 1
+
+        async for m in client.iter_messages(**iter_kwargs):
+            if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
+                continue
+            if not m.text and not getattr(m, 'media', None):
+                continue
+
+            all_ids.append(m.id)
+            total += 1
+            if m.text and not getattr(m, 'media', None):
+                text_count += 1
+                text_messages.append({
+                    "id": m.id,
+                    "snippet": m.text[:140],
+                    "date": m.date.strftime('%Y-%m-%d %H:%M') if m.date else '',
+                    "length": len(m.text)
+                })
+            elif getattr(m, 'media', None):
+                media_count += 1
+
+    all_ids.sort()
+    text_messages.sort(key=lambda x: x["id"])
+
+    return {
+        "title": title,
+        "total_messages": total,
+        "text_count": text_count,
+        "media_count": media_count,
+        "text_messages": text_messages,
+        "all_ids": all_ids
+    }
+
 # --- FORWARD & RESTRICTION HANDLERS ---
 
 async def is_forward_restricted(chat_entity):
@@ -623,27 +738,34 @@ async def help_handler(event):
         "🤖 **Telegram History Cloner & Topic Engine**\n\n"
         "⚡ **Features:**\n"
         "• Native 100-batch forwarding directly into forum topics (`top_msg_id`)\n"
-        "• Live batch start & progress updates every 10 messages\n"
-        "• From-To Link forwarding: copy start & end message links\n"
+        "• 1 single API call per 100 messages (maximum efficiency & zero rate limits)\n"
+        "• Telegram Mini App & Web Dashboard (`/app`)\n"
+        "• Smart Text Analysis & selective/all text pinning (`/scan`, `/pintext`)\n"
+        "• Auto-clean temporary checkpoint headers (`/cleanheader`)\n"
+        "• From-To Link & ID range forwarding\n"
         "• Multi-topic/channel queue: paste 10+ links and go to sleep!\n"
-        "• Whole-group topic auto-discovery (fetches ALL topics in a group)\n"
+        "• Whole-group topic auto-discovery\n"
         "• Anonymous Admin compatible & optional `/setsendas`\n"
         "• 35–50s batch delay + 5–8 min breather every 4–8 batches\n"
-        "• 5-min forward unlock auto-checker\n"
         "• Saved Messages Cloud Brain Storage\n\n"
         "📋 **Commands:**\n"
-        "• `/setdest <link>` — Set target group, channel, or specific topic\n"
-        "• `/fromto <from_link> <to_link>` — Forward message range (same chat) OR forward from source to destination\n"
-        "• `/range <from_link> <to_link>` — Quick message range forwarder into destination topic\n"
-        "• `/clone [new|here] <link1> <link2>...` — Queue 1 or many topics/channels/ranges\n"
-        "• `/setsendas <channel_link|off>` — Set channel to send as (or leave off for Anonymous Admin)\n"
+        "• `/app` — Open Web Dashboard & Mini App interface\n"
+        "• `/scan <source> [topic]` — Analyze topic & preview pure text messages\n"
+        "• `/pintext <all|off>` — Auto-pin forwarded text messages in destination\n"
+        "• `/cleanheader <on|off>` — Auto-delete checkpoint header after clone\n"
+        "• `/setdest <link_or_id>` — Set target group, channel, or specific topic\n"
+        "• `/fromto <from> <to>` — Forward message range (same chat) OR forward to destination\n"
+        "• `/range <from> <to>` — Quick message range forwarder into destination topic\n"
+        "• `/clone [new|here] <target1>...` — Queue 1 or many topics/channels/ranges\n"
+        "• `/setsendas <channel_link|off>` — Set channel to send as\n"
         "• `/queue` — View all pending/active items in queue\n"
         "• `/status` — Live dashboard, batch counts, delays\n"
         "• `/pause` / `/resume` — Pause or resume execution\n"
         "• `/stop` — Cancel active task & wipe queue\n"
         "• `/purge` — Bulk delete last forwarded messages from destination\n\n"
         f"🎯 **Destination:** `{dest_str}`{dest_topic_display}\n"
-        f"👤 **Send As:** `{state.get('send_as_link') or 'Default (Anonymous if enabled)'}`"
+        f"👤 **Send As:** `{state.get('send_as_link') or 'Default (Anonymous if enabled)'}`\n"
+        f"📌 **Pin Text Mode:** `{state.get('pin_text_mode', 'none')}` | 🧹 **Clean Header:** `{'ON' if state.get('delete_header_on_finish', True) else 'OFF'}`"
     )
     await event.reply(help_text)
 
@@ -1002,6 +1124,96 @@ async def purge_handler(event):
     await sync_brain_storage()
     await prog.edit(f"✅ **Purge Completed!** Deleted {deleted} messages from destination.")
 
+@client.on(events.NewMessage(pattern=r'^/(?:scan|analyze)(?:\s+(.+))?$', outgoing=True))
+async def scan_command_handler(event):
+    raw = event.pattern_match.group(1)
+    if not raw:
+        await event.reply("⚠️ **Usage:** `/scan <source_link_or_chat> [topic_id]`")
+        return
+
+    tokens = raw.strip().split()
+    src_input = tokens[0]
+    topic_override = int(tokens[1]) if len(tokens) > 1 and tokens[1].isdigit() else None
+
+    c_id, t_id, s_id, e_id, is_r, has_t = parse_telegram_link(src_input)
+    if topic_override:
+        t_id = topic_override
+    if not c_id:
+        await event.reply("❌ Invalid source link or chat ID.")
+        return
+
+    status_m = await event.reply("🔍 **Scanning and analyzing source in MTProto...**")
+    try:
+        res = await analyze_source(c_id, t_id, s_id, e_id)
+        text_preview = ""
+        for item in res["text_messages"][:8]:
+            text_preview += f"• **Msg #{item['id']}**: `{item['snippet'][:60]}...`\n"
+
+        if len(res["text_messages"]) > 8:
+            text_preview += f"*(+ {len(res['text_messages']) - 8} more text posts)*\n"
+
+        if not text_preview:
+            text_preview = "*(No pure text posts detected)*\n"
+
+        out = (
+            f"📊 **Analysis for *\"{res['title']}\"*:**\n\n"
+            f"• **Total Messages:** `{res['total_messages']}`\n"
+            f"• **Media Posts:** `{res['media_count']}`\n"
+            f"• **Pure Text Posts:** `{res['text_count']}`\n\n"
+            f"📝 **Text Posts Preview:**\n"
+            f"{text_preview}\n"
+            f"💡 **Tip:** Use `/pintext all` to auto-pin all text posts on clone, or open the Web Dashboard with `/app` to hand-pick!"
+        )
+        await status_m.edit(out)
+    except Exception as e:
+        await status_m.edit(f"❌ Analysis failed: `{e}`")
+
+@client.on(events.NewMessage(pattern=r'^/pintext(?:\s+(.+))?$', outgoing=True))
+async def pintext_command_handler(event):
+    arg = (event.pattern_match.group(1) or '').strip().lower()
+    if arg in ['on', 'all', 'yes', 'true']:
+        state["pin_text_mode"] = "all"
+        save_local_config()
+        await sync_brain_storage()
+        await event.reply("📌 **Auto-Pin Text Posts: ON (All Pure Text Messages will be pinned in destination)**")
+    elif arg in ['off', 'none', 'no', 'false']:
+        state["pin_text_mode"] = "none"
+        save_local_config()
+        await sync_brain_storage()
+        await event.reply("📌 **Auto-Pin Text Posts: OFF**")
+    else:
+        await event.reply(
+            f"📌 **Current Pin-Text Mode:** `{state.get('pin_text_mode', 'none')}`\n\n"
+            f"Usage: `/pintext <all|off>` or select individual messages in the Mini App (`/app`)."
+        )
+
+@client.on(events.NewMessage(pattern=r'^/cleanheader(?:\s+(.+))?$', outgoing=True))
+async def cleanheader_command_handler(event):
+    arg = (event.pattern_match.group(1) or '').strip().lower()
+    if arg in ['on', 'yes', 'true']:
+        state["delete_header_on_finish"] = True
+        save_local_config()
+        await sync_brain_storage()
+        await event.reply("🧹 **Clean Header: ON** (Checkpoint headers will be automatically deleted when transfer completes).")
+    elif arg in ['off', 'no', 'false']:
+        state["delete_header_on_finish"] = False
+        save_local_config()
+        await sync_brain_storage()
+        await event.reply("🧹 **Clean Header: OFF** (Checkpoint headers will remain pinned).")
+    else:
+        current = "ON" if state.get("delete_header_on_finish", True) else "OFF"
+        await event.reply(f"🧹 **Current Clean Header setting:** `{current}`\nUsage: `/cleanheader <on|off>`")
+
+@client.on(events.NewMessage(pattern=r'^/(?:app|dashboard|web|miniapp)$', outgoing=True))
+async def app_command_handler(event):
+    port = os.environ.get("PORT", "8080")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL") or f"http://localhost:{port}"
+    await event.reply(
+        f"📱 **TeleCloner Mini App & Web Dashboard**\n\n"
+        f"🌐 **Dashboard URL:** `{render_url}`\n\n"
+        f"⚡ Open this URL in your browser or set it as your Telegram Bot WebApp Menu Button in @BotFather to launch directly inside Telegram!"
+    )
+
 # --- CLONE QUEUE COMPILER & RUNNER ---
 
 @client.on(events.NewMessage(pattern=r'^/clone(?:\s+([\s\S]+))?$', outgoing=True))
@@ -1224,7 +1436,8 @@ async def run_queue_pipeline(dest_entity, status_msg):
 
         if state.get("is_running"):
             state["current_status"] = "Queue Finished"
-            await status_msg.edit(
+            await safe_edit_status(
+                status_msg,
                 f"🏆 **Grand Queue Concluded!**\n\n"
                 f"📦 Processed all `{len(state['queue'])}` items successfully.\n"
                 f"📊 Total messages transferred: `{len(state.get('last_sent_ids', []))}`"
@@ -1550,6 +1763,26 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
             save_local_config()
             await sync_brain_storage()
 
+            # Process Smart Text Pinning
+            pin_mode = task.get("pin_text_mode", state.get("pin_text_mode", "none"))
+            pinned_src_ids = set(task.get("pinned_ids", []))
+            pure_text_ids = set(task.get("pure_text_ids", []))
+
+            if pin_mode != "none" and len(sent) == len(batch_ids):
+                for src_id, dest_id in zip(batch_ids, sent):
+                    should_pin = False
+                    if pin_mode == "all" and src_id in pure_text_ids:
+                        should_pin = True
+                    elif pin_mode == "custom" and src_id in pinned_src_ids:
+                        should_pin = True
+
+                    if should_pin:
+                        try:
+                            await client.pin_message(dest_entity, dest_id, notify=False)
+                            logger.info(f"📌 Pinned text message in destination: src={src_id} -> dest={dest_id}")
+                        except Exception as pe:
+                            logger.debug(f"Could not pin message {dest_id}: {pe}")
+
         # Batch completed!
         if state.get("active_task"):
             state["active_task"]["batches_done"] = state["active_task"].get("batches_done", 0) + 1
@@ -1583,6 +1816,13 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
         # Check if this was the last batch of the task
         if b_idx >= total_batches:
             logger.info(f"All batches for '{topic_title}' completed!")
+            delete_hdr = task.get("clean_header", state.get("delete_header_on_finish", True))
+            if delete_hdr and h_msg_id:
+                try:
+                    await client.delete_messages(dest_entity, [h_msg_id])
+                    logger.info(f"Deleted checkpoint header {h_msg_id} after task completion.")
+                except Exception as de:
+                    logger.debug(f"Could not delete checkpoint header: {de}")
             break
 
         # Breather Check (Every 4 to 8 batches, sleep for 5 to 8 minutes)
@@ -1632,18 +1872,256 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
                     break
                 await asyncio.sleep(2)
 
-# --- DUMMY RENDER APP PING SERVER ---
+# --- TELEGRAM MINI APP & WEB DASHBOARD HTTP SERVER ---
+
+async def handle_webapp_html(request):
+    """Serves the rich, responsive glassmorphic Mini App HTML."""
+    html = get_webapp_html()
+    return web.Response(text=html, content_type="text/html")
+
 async def handle_health_check(request):
+    """Health check endpoint for Render/uptime pingers."""
     return web.Response(text="Render Userbot container instance actively running.")
+
+async def handle_api_status(request):
+    """Returns real-time status and operational metrics to the web dashboard."""
+    data = get_serializable_state()
+    data["is_running"] = state.get("is_running", False)
+    data["is_paused"] = state.get("is_paused", False)
+    data["total_transferred"] = len(state.get("last_sent_ids", []))
+    data["queue_len"] = len(state.get("queue", []))
+    data["current_status"] = state.get("current_status", "Idle")
+    data["dest_link"] = state.get("dest_link")
+    data["active_task"] = state.get("active_task")
+    data["queue_index"] = state.get("queue_index", 0)
+    data["queue"] = state.get("queue", [])
+    data["pin_text_mode"] = state.get("pin_text_mode", "none")
+    data["delete_header_on_finish"] = state.get("delete_header_on_finish", True)
+    return web.json_response(data)
+
+async def handle_api_analyze(request):
+    """Pre-scans the source topic/chat to identify and preview all pure text messages."""
+    try:
+        body = await request.json()
+        src_input = (body.get("source") or "").strip()
+        topic_override = body.get("topic_id")
+
+        if not src_input:
+            return web.json_response({"success": False, "error": "Source chat ID or link is required."}, status=400)
+
+        c_id, t_id, s_id, e_id, is_r, has_t = parse_telegram_link(src_input)
+        if topic_override:
+            try:
+                t_id = int(topic_override)
+            except ValueError:
+                pass
+
+        if not c_id:
+            return web.json_response({"success": False, "error": "Invalid source link or chat ID."}, status=400)
+
+        res = await analyze_source(c_id, t_id, s_id, e_id)
+        return web.json_response({"success": True, **res})
+    except Exception as e:
+        logger.error(f"API analyze error: {e}", exc_info=True)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+async def handle_api_clone(request):
+    """Queues and triggers a 100-batch clone task from the Web Dashboard."""
+    try:
+        body = await request.json()
+        src_input = (body.get("source") or "").strip()
+        src_topic = body.get("source_topic_id")
+        dest_input = (body.get("destination") or "").strip()
+        dest_topic = body.get("destination_topic_id")
+        mode = body.get("mode") or "here"
+        range_input = (body.get("range") or "").strip()
+        clean_header = bool(body.get("clean_header", True))
+        pin_mode = body.get("pin_mode") or "none"
+        pinned_ids = [int(x) for x in body.get("pinned_ids", []) if str(x).isdigit()]
+        pure_text_ids = [int(x) for x in body.get("pure_text_ids", []) if str(x).isdigit()]
+
+        if not src_input:
+            return web.json_response({"success": False, "error": "Source link or chat ID is required."}, status=400)
+        if not dest_input:
+            return web.json_response({"success": False, "error": "Destination link or chat ID is required."}, status=400)
+
+        dest_chat_spec = dest_input
+        if dest_topic and str(dest_topic) not in dest_input:
+            dest_chat_spec = f"{dest_input} {dest_topic}"
+        state["dest_link"] = dest_chat_spec
+        state["delete_header_on_finish"] = clean_header
+        state["pin_text_mode"] = pin_mode
+        state["pinned_ids"] = pinned_ids
+        save_local_config()
+        await sync_brain_storage()
+
+        dest_chat, d_topic_id, _, _, _, dest_has_topic = parse_destination_link(dest_chat_spec)
+        if dest_topic:
+            try:
+                d_topic_id = int(dest_topic)
+            except ValueError:
+                pass
+
+        if not dest_chat:
+            return web.json_response({"success": False, "error": "Destination link or chat ID is invalid."}, status=400)
+
+        try:
+            dest_entity = await client.get_entity(dest_chat)
+        except Exception as e:
+            return web.json_response({"success": False, "error": f"Could not resolve destination: {e}"}, status=400)
+
+        s_chat, s_topic_id, start_id, end_id, is_range, has_t = parse_telegram_link(src_input)
+        if src_topic:
+            try:
+                s_topic_id = int(src_topic)
+            except ValueError:
+                pass
+
+        if range_input:
+            m = re.match(r'(\d+)[\s\-:,]+(\d+)', range_input)
+            if m:
+                start_id = int(m.group(1))
+                end_id = int(m.group(2))
+                is_range = True
+
+        if not s_chat:
+            return web.json_response({"success": False, "error": "Invalid source link or chat ID."}, status=400)
+
+        try:
+            src_entity = await client.get_entity(s_chat)
+        except Exception as e:
+            return web.json_response({"success": False, "error": f"Could not resolve source: {e}"}, status=400)
+
+        topic_title = None
+        if s_topic_id and s_topic_id > 1:
+            topic_title = await get_topic_title(src_entity, s_topic_id)
+        if not topic_title:
+            base_title = getattr(src_entity, 'title', None) or f"Chat_{s_chat}"
+            if s_topic_id:
+                topic_title = f"{base_title} (Topic #{s_topic_id})"
+            else:
+                topic_title = base_title
+
+        if start_id and end_id:
+            topic_title = f"{topic_title} (Msg {start_id}–{end_id})"
+
+        new_task = {
+            "title": topic_title,
+            "source_link": src_input,
+            "src_chat": s_chat,
+            "src_topic_id": s_topic_id,
+            "start_id": start_id,
+            "end_id": end_id,
+            "is_range": is_range,
+            "mode": mode,
+            "target_topic_id": d_topic_id,
+            "clean_header": clean_header,
+            "pin_text_mode": pin_mode,
+            "pinned_ids": pinned_ids,
+            "pure_text_ids": pure_text_ids
+        }
+
+        if not state.get("is_running"):
+            state["queue"] = [new_task]
+            state["queue_index"] = 0
+            state["is_running"] = True
+            state["is_paused"] = False
+            save_local_config()
+            await sync_brain_storage()
+            asyncio.create_task(run_queue_pipeline(dest_entity, None))
+        else:
+            state["queue"].append(new_task)
+            save_local_config()
+            await sync_brain_storage()
+
+        return web.json_response({
+            "success": True,
+            "message": f"Pipeline queued task '{topic_title}' successfully.",
+            "queue_length": len(state["queue"])
+        })
+    except Exception as e:
+        logger.error(f"API clone error: {e}", exc_info=True)
+        return web.json_response({"success": False, "error": str(e)}, status=500)
+
+async def handle_api_pause(request):
+    """Pauses the cloning pipeline."""
+    state["is_paused"] = True
+    state["current_status"] = "Paused via Dashboard"
+    save_local_config()
+    await sync_brain_storage()
+    return web.json_response({"success": True, "message": "Pipeline paused."})
+
+async def handle_api_resume(request):
+    """Resumes the paused cloning pipeline."""
+    state["is_paused"] = False
+    state["current_status"] = "Resumed via Dashboard"
+    save_local_config()
+    await sync_brain_storage()
+    return web.json_response({"success": True, "message": "Pipeline resumed."})
+
+async def handle_api_stop(request):
+    """Cancels active cloning and wipes the queue."""
+    state["is_running"] = False
+    state["is_paused"] = False
+    state["queue"] = []
+    state["queue_index"] = 0
+    state["active_task"] = None
+    state["current_status"] = "Stopped via Dashboard"
+    save_local_config()
+    await sync_brain_storage()
+    return web.json_response({"success": True, "message": "Pipeline stopped and queue cleared."})
+
+async def handle_api_purge(request):
+    """Purges the last batch of transferred messages from the destination."""
+    sent_ids = state.get("last_sent_ids", [])
+    if not sent_ids:
+        return web.json_response({"success": False, "error": "No recorded messages to purge."}, status=400)
+    if not state.get("dest_link"):
+        return web.json_response({"success": False, "error": "Destination link missing."}, status=400)
+
+    dest_chat, _, _, _, _, _ = parse_destination_link(state["dest_link"])
+    if not dest_chat:
+        return web.json_response({"success": False, "error": "Invalid destination link."}, status=400)
+
+    deleted = 0
+    for i in range(0, len(sent_ids), 100):
+        chunk = sent_ids[i:i+100]
+        try:
+            await client.delete_messages(dest_chat, chunk)
+            deleted += len(chunk)
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            logger.error(f"Purge error: {e}")
+
+    state["last_sent_ids"] = []
+    save_local_config()
+    await sync_brain_storage()
+    return web.json_response({"success": True, "deleted": deleted})
 
 async def start_web_server():
     app = web.Application()
-    app.router.add_get('/', handle_health_check)
+    # Web Dashboard & Mini App
+    app.router.add_get('/', handle_webapp_html)
+    app.router.add_get('/app', handle_webapp_html)
+    app.router.add_get('/dashboard', handle_webapp_html)
+    # Health check endpoints
+    app.router.add_get('/health', handle_health_check)
+    app.router.add_get('/ping', handle_health_check)
+    # REST API endpoints
+    app.router.add_get('/api/status', handle_api_status)
+    app.router.add_post('/api/analyze', handle_api_analyze)
+    app.router.add_post('/api/clone', handle_api_clone)
+    app.router.add_post('/api/pause', handle_api_pause)
+    app.router.add_post('/api/resume', handle_api_resume)
+    app.router.add_post('/api/stop', handle_api_stop)
+    app.router.add_post('/api/purge', handle_api_purge)
+
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
+    logger.info(f"🚀 TeleCloner Web Dashboard & Mini App listening on port {port}")
 
 # --- SMART ANCHOR RECOVERY UTILITIES ---
 
