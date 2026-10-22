@@ -546,7 +546,14 @@ async def analyze_source(src_chat, src_topic_id=None, start_id=None, end_id=None
             pass
 
         try:
-            async for m in client.iter_messages(src_entity, reply_to=src_topic_id):
+            iter_kwargs = {'reply_to': src_topic_id}
+            if start_id and end_id:
+                iter_kwargs['min_id'] = start_id - 1
+                iter_kwargs['max_id'] = end_id + 1
+            elif start_id:
+                iter_kwargs['min_id'] = start_id - 1
+
+            async for m in client.iter_messages(src_entity, **iter_kwargs):
                 if not m or getattr(m, '_empty', False) or getattr(m, 'action', None):
                     continue
                 if not m.text and not getattr(m, 'media', None):
@@ -1905,6 +1912,7 @@ async def handle_api_analyze(request):
         body = await request.json()
         src_input = (body.get("source") or "").strip()
         topic_override = body.get("topic_id")
+        range_input = (body.get("range") or "").strip()
 
         if not src_input:
             return web.json_response({"success": False, "error": "Source chat ID or link is required."}, status=400)
@@ -1915,6 +1923,14 @@ async def handle_api_analyze(request):
                 t_id = int(topic_override)
             except ValueError:
                 pass
+
+        if range_input:
+            m = re.match(r'(\d+)[\s\-:,]+(\d+)', range_input)
+            if m:
+                s_id = int(m.group(1))
+                e_id = int(m.group(2))
+                if not topic_override and t_id == s_id:
+                    t_id = None
 
         if not c_id:
             return web.json_response({"success": False, "error": "Invalid source link or chat ID."}, status=400)
@@ -1983,6 +1999,8 @@ async def handle_api_clone(request):
                 start_id = int(m.group(1))
                 end_id = int(m.group(2))
                 is_range = True
+                if not src_topic and s_topic_id == start_id:
+                    s_topic_id = None
 
         if not s_chat:
             return web.json_response({"success": False, "error": "Invalid source link or chat ID."}, status=400)

@@ -471,17 +471,24 @@ def get_webapp_html():
 
     <!-- Source & Analysis Card -->
     <div class="card">
-      <div class="card-title">📤 1. Source & Topic Analysis</div>
+      <div class="card-title">📤 1. Source & Message Range</div>
+      <div class="form-group">
+        <label>Source Chat Link or ID (-100... or 220...)</label>
+        <input type="text" id="src-input" placeholder="e.g. -1002200390931 or https://t.me/c/2200390931/899">
+      </div>
       <div class="form-row">
-        <div class="form-group">
-          <label>Source Chat Link or ID (-100... or 220...)</label>
-          <input type="text" id="src-input" placeholder="e.g. -1002200390931 or https://t.me/c/2200390931/899">
-        </div>
         <div class="form-group">
           <label>Topic ID (Optional)</label>
           <input type="number" id="src-topic" placeholder="e.g. 899">
         </div>
+        <div class="form-group">
+          <label>Range (Start–End ID, Optional)</label>
+          <input type="text" id="src-range" placeholder="e.g. 100-500">
+        </div>
       </div>
+      <p style="font-size:0.78rem; color:var(--text-muted); margin-top:-6px; margin-bottom:14px;">
+        💡 <strong>Note:</strong> Set a range to only scan and clone that specific slice of messages instead of the full topic/channel.
+      </p>
       <button class="btn btn-secondary" id="btn-scan" onclick="scanSource()">
         <span>🔍 Scan & Analyze Text Posts</span>
       </button>
@@ -522,18 +529,12 @@ def get_webapp_html():
         </div>
       </div>
 
-      <div class="form-row">
-        <div class="form-group">
-          <label>Delivery Mode</label>
-          <select id="mode-select">
-            <option value="here">Post into specified topic/root (Here)</option>
-            <option value="new">Create new forum topic per item (New)</option>
-          </select>
-        </div>
-        <div class="form-group">
-          <label>Range (Start–End ID, Optional)</label>
-          <input type="text" id="range-input" placeholder="e.g. 100-500">
-        </div>
+      <div class="form-group">
+        <label>Delivery Mode</label>
+        <select id="mode-select">
+          <option value="here">Post into specified topic/root (Here)</option>
+          <option value="new">Create new forum topic per item (New)</option>
+        </select>
       </div>
 
       <div style="margin: 12px 0;">
@@ -642,6 +643,7 @@ def get_webapp_html():
     async function scanSource() {
       const src = document.getElementById('src-input').value.trim();
       const topic = document.getElementById('src-topic').value.trim();
+      const range = document.getElementById('src-range').value.trim();
       if (!src) {
         alert('Please enter a source chat ID or link first.');
         return;
@@ -655,7 +657,11 @@ def get_webapp_html():
         const res = await fetch('/api/analyze', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source: src, topic_id: topic ? parseInt(topic) : null })
+          body: JSON.stringify({
+            source: src,
+            topic_id: topic ? parseInt(topic) : null,
+            range: range || null
+          })
         });
         const data = await res.json();
         if (!data.success) {
@@ -667,7 +673,8 @@ def get_webapp_html():
         const box = document.getElementById('analysis-box');
         box.style.display = 'block';
 
-        document.getElementById('analysis-summary').textContent = `📊 Found ${data.total_messages} messages (${data.media_count} media, ${data.text_count} text)`;
+        const rangeLabel = range ? ` (Range ${range})` : '';
+        document.getElementById('analysis-summary').textContent = `📊 Found ${data.total_messages} messages${rangeLabel} (${data.media_count} media, ${data.text_count} text)`;
         document.getElementById('analysis-count').textContent = `${data.text_count} text posts`;
 
         const list = document.getElementById('text-items-list');
@@ -700,11 +707,11 @@ def get_webapp_html():
     async function startClone() {
       const src = document.getElementById('src-input').value.trim();
       const srcTopic = document.getElementById('src-topic').value.trim();
+      const srcRange = document.getElementById('src-range').value.trim();
       const dest = document.getElementById('dest-input').value.trim();
       const destTopic = document.getElementById('dest-topic').value.trim();
       const mode = document.getElementById('mode-select').value;
       const cleanHeader = document.getElementById('toggle-clean-header').checked;
-      const range = document.getElementById('range-input').value.trim();
 
       if (!src) { alert('Please enter source'); return; }
       if (!dest) { alert('Please enter destination'); return; }
@@ -717,7 +724,7 @@ def get_webapp_html():
         destination: dest,
         destination_topic_id: destTopic ? parseInt(destTopic) : null,
         mode: mode,
-        range: range,
+        range: srcRange,
         clean_header: cleanHeader,
         pin_mode: currentPinMode,
         pinned_ids: Array.from(selectedTextIds),
