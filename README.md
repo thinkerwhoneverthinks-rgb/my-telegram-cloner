@@ -27,6 +27,9 @@ An asynchronous, cloud-ready Telegram userbot built with **Telethon** and **aioh
 
 ## 🌟 Key Features
 
+* **Direct Topic Delivery (`top_msg_id`):** Forwards messages directly into specific forum topics without losing thread alignment or creating unwanted duplicate topics.
+* **Live Batch & 10-Message Progress Indicator:** Shows real-time feedback when each batch starts, updates progress every 10 messages collected/read, and displays dispatch countdowns so you always know it's working.
+* **From-To Link Forwarding (`/fromto` & `/range`):** Copy the start message link and end message link directly from Telegram; the bot automatically calculates the range and transfers it into your target destination topic!
 * **Multi-Topic Task Queue:** Paste 5, 10, or 20+ topic/channel links at once. The bot processes them sequentially in the background while you close Telegram and sleep.
 * **Whole-Group Forum Topic Auto-Discovery:** Paste just the group link (`https://t.me/c/1234567890`), and the bot automatically fetches **every single topic** inside that group and queues them!
 * **Native 100-Batch Forwarding (`drop_author=True`):** Forwards up to 100 messages per request without the *"Forwarded from"* tag. Albums and multi-photo media remain intact.
@@ -160,15 +163,88 @@ All commands must be sent from your own Telegram account (outgoing messages):
 
 | Command | Usage | What it does |
 | :--- | :--- | :--- |
-| **`/setdest <link>`** | `/setdest https://t.me/c/1234567890/55` | Saves your target group, channel, or topic permanently. |
+| **`/setdest <link>`** | `/setdest https://t.me/c/1234567890/55` | Saves target chat and specific topic permanently. Validates topic & entity. |
+| **`/fromto <from> <to>`** | `/fromto https://t.me/c/123/10 https://t.me/c/123/150` | Forwards range from start link to end link (same chat) OR sets destination to link 2 and clones link 1! |
+| **`/range <from> <to>`** | `/range https://t.me/c/123/10 https://t.me/c/123/150` | Quick message range forwarder into destination topic. |
+| **`/clone [new\|here] <links>`** | `/clone here https://t.me/c/.../1 https://t.me/c/.../2` | **Queues 1 or many links** (or entire groups). Supports `<from> to <to>` syntax! |
 | **`/setsendas <link\|off>`** | `/setsendas @MyChannel` | Sets a channel to send as, or `off` for default (Anonymous Admin). |
-| **`/clone [new\|here] <links>`** | `/clone here https://t.me/c/.../1 https://t.me/c/.../2` | **Queues 1 or many links** (or entire groups). Runs in background! |
 | **`/queue`** | `/queue` | Displays all pending and active items in the queue. |
-| **`/status`** | `/status` | Shows live progress, active item, batch count, and breather countdown. |
+| **`/status`** | `/status` | Shows live progress, destination topic, active item, batch count, and delays. |
 | **`/pause`** | `/pause` | Safely freezes the clone loop at the next batch. |
 | **`/resume`** | `/resume` | Unpauses and continues forwarding. |
 | **`/stop`** | `/stop` | Cancels the active task completely and clears queue. |
 | **`/purge`** | `/purge` | Bulk-deletes all messages forwarded in this/last task from destination in chunks of 100. |
+
+---
+
+## 🔗 4.1 From-To Link Forwarding (Start & End Message Range)
+
+You no longer have to manually construct range numbers with hyphens! Simply copy the link to the starting message and the link to the ending message directly from Telegram Desktop or Mobile:
+
+### Method A: Same Chat Message Range (`/fromto` or `/range`)
+```text
+/fromto https://t.me/c/1234567890/100 https://t.me/c/1234567890/250
+```
+* **What happens:** The bot identifies that both links belong to chat `1234567890`, extracts message IDs `100` and `250`, and queues all messages from 100 to 250 to be forwarded directly into your configured destination topic!
+
+### Method B: In Forum Topics with Topics
+```text
+/fromto https://t.me/c/1234567890/55/10 https://t.me/c/1234567890/55/80
+```
+* Transfers messages 10 through 80 from topic `55` into your destination topic!
+
+### Method C: Source Link to Destination Link
+```text
+/fromto https://t.me/source_channel/10-100 https://t.me/c/dest_group/42
+```
+* When the two links belong to different chats, the bot sets the second link (`https://t.me/c/dest_group/42`, topic 42) as the permanent destination, and forwards the first link directly into topic 42!
+
+### Method D: Inside `/clone`
+You can also use natural From-To syntax inside `/clone`:
+```text
+/clone https://t.me/c/1234567890/100 to https://t.me/c/1234567890/250
+```
+or just space-separated links:
+```text
+/clone https://t.me/c/1234567890/100 https://t.me/c/1234567890/250
+```
+
+---
+
+## 🎯 4.2 Setting Destination Forum Topics (`/setdest`)
+
+The bot now natively targets Telegram forum topics via MTProto `top_msg_id`:
+* **Private Forum Topic:**
+  ```text
+  /setdest https://t.me/c/1234567890/55
+  ```
+* **Public Forum Topic:**
+  ```text
+  /setdest https://t.me/myforumgroup/55
+  ```
+* **Copied Message Link inside Topic:**
+  ```text
+  /setdest https://t.me/c/1234567890/55/123
+  ```
+* **Space-separated ID format:**
+  ```text
+  /setdest -1001234567890 55
+  ```
+
+Upon setting, the bot validates your topic, fetches its title, and confirms:
+`🏷️ Destination Topic: "General / Topic Name" (ID: 55)`
+All forwarded batches will land cleanly inside topic 55!
+
+---
+
+## ⚡ 4.3 Real-Time Progress Tracking (Live Every 10 Messages)
+
+During large transfers, the bot provides continuous visual progress updates:
+1. **Batch Start Notice:** `🚀 Starting Batch #1 for "My Topic"...`
+2. **Streaming Progress (Every 10 messages):** `⏳ Batch #1 in Progress: 10/100, 20/100, 30/100... messages ready (Current Msg ID: #1450). Active & working...`
+3. **Dispatch Notice:** `📤 Forwarding Batch #1 (100 messages) to Topic #55...`
+4. **Delivered Notice:** `✅ Batch #1 Delivered! (100 messages sent). Cooldown delay (42s) before next batch...`
+5. **Breather Breaks:** Shows an auto-countdown during 5–8 min human breathers.
 
 ---
 

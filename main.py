@@ -180,6 +180,70 @@ async def load_brain_storage():
 
 # --- LINK PARSER & METADATA UTILITIES ---
 
+def parse_destination_link(dest):
+    """
+    Parses any Telegram link or chat/topic input into (chat_id, topic_id, None, None, False, has_topic).
+    Supports:
+    - https://t.me/c/1234567890/55 (private forum group topic)
+    - https://t.me/c/1234567890/55/100 (message in topic 55)
+    - https://t.me/publicgroup/55 (public forum topic)
+    - https://t.me/c/1234567890 55 or -1001234567890 55 (space-separated chat and topic)
+    - https://t.me/c/1234567890?topic=55
+    - -1001234567890/55
+    - Standard non-topic channel/group links (topic_id=None, has_topic=False)
+    """
+    if not dest:
+        return None, None, None, None, False, False
+
+    dest = dest.strip()
+    explicit_topic = None
+
+    # Check for space format: '<link_or_chat> <topic_id>'
+    space_parts = dest.split()
+    if len(space_parts) == 2 and space_parts[1].isdigit():
+        dest = space_parts[0]
+        explicit_topic = int(space_parts[1])
+
+    # Check for ?topic=123 parameter
+    topic_param = re.search(r'[?&]topic=(\d+)', dest)
+    if topic_param:
+        explicit_topic = int(topic_param.group(1))
+
+    # Match t.me link
+    match = re.search(r't\.me/(?:c/)?([^/?#]+)(?:/(\d+))?(?:/(\d+))?', dest)
+    if match:
+        chat_raw = match.group(1)
+        seg1 = match.group(2)
+        seg2 = match.group(3)
+
+        if 't.me/c/' in dest and not chat_raw.startswith('-100'):
+            try:
+                chat_id = int('-100' + chat_raw)
+            except ValueError:
+                chat_id = chat_raw
+        else:
+            try:
+                chat_id = int(chat_raw)
+            except ValueError:
+                chat_id = chat_raw
+
+        topic_id = explicit_topic
+        if topic_id is None:
+            if seg1:
+                topic_id = int(seg1)
+
+        has_topic = topic_id is not None
+        return chat_id, topic_id, None, None, False, has_topic
+
+    # Raw chat ID with /topic_id: -100123456/55 or -100123456
+    raw_match = re.search(r'^(-?\d+)(?:/(\d+))?$', dest)
+    if raw_match:
+        chat_id = int(raw_match.group(1))
+        topic_id = explicit_topic or (int(raw_match.group(2)) if raw_match.group(2) else None)
+        return chat_id, topic_id, None, None, False, topic_id is not None
+
+    return None, None, None, None, False, False
+
 def parse_telegram_link(link):
     """
     Parses any Telegram link into (chat_id, topic_id, start_id, end_id, is_range, has_explicit_topic).
@@ -188,7 +252,7 @@ def parse_telegram_link(link):
         return None, None, None, None, False, False
 
     link = link.strip()
-    match = re.search(r't\.me/(?:c/)?([^/]+)(?:/(\d+(?:-\d+)?))?(?:/(\d+(?:-\d+)?))?', link)
+    match = re.search(r't\.me/(?:c/)?([^/?#]+)(?:/(\d+(?:-\d+)?))?(?:/(\d+(?:-\d+)?))?', link)
     if not match:
         return None, None, None, None, False, False
 
@@ -234,6 +298,27 @@ def parse_telegram_link(link):
         has_explicit_topic = False
 
     return chat_id, topic_id, start_id, end_id, is_range, has_explicit_topic
+
+_last_status_edit_time = 0
+
+async def safe_edit_status(status_msg, text):
+    """Safely edits status messages with rate limiting and flood handling."""
+    global _last_status_edit_time
+    if not status_msg:
+        return
+    now = asyncio.get_event_loop().time()
+    diff = now - _last_status_edit_time
+    if diff < 1.5:
+        await asyncio.sleep(1.5 - diff)
+    try:
+        await status_msg.edit(text)
+        _last_status_edit_time = asyncio.get_event_loop().time()
+    except (errors.MessageNotModifiedError, errors.rpcerrorlist.MessageNotModifiedError):
+        pass
+    except errors.FloodWaitError as fwe:
+        logger.debug(f"FloodWait on status edit ({fwe.seconds}s), skipping visual update.")
+    except Exception as e:
+        logger.debug(f"Status edit suppressed: {e}")
 
 async def get_topic_title(chat_entity, topic_id):
     """Retrieves title of a forum topic."""
@@ -368,33 +453,58 @@ async def resolve_send_as_entity():
 async def forward_batch_clean(dest_entity, src_entity, batch_ids, dest_topic_id=None, send_as_entity=None):
     """
     Forwards up to 100 messages at once without quote tag (drop_author=True).
-    Supports send_as if specified.
+    Uses raw ForwardMessagesRequest to reliably route to forum topics (top_msg_id=dest_topic_id)
+    and support send_as.
     """
+    to_peer = await client.get_input_entity(dest_entity)
+    from_peer = await client.get_input_entity(src_entity)
+    send_as_peer = await client.get_input_entity(send_as_entity) if send_as_entity else None
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
+            random_ids = [random.randint(0, 0x7fffffffffffffff) for _ in batch_ids]
             kwargs = {
-                "entity": dest_entity,
-                "messages": batch_ids,
-                "from_peer": src_entity,
-                "reply_to": dest_topic_id,
+                "from_peer": from_peer,
+                "id": batch_ids,
+                "to_peer": to_peer,
+                "random_id": random_ids,
                 "drop_author": True
             }
-            if send_as_entity:
-                kwargs["send_as"] = send_as_entity
+            if dest_topic_id:
+                kwargs["top_msg_id"] = int(dest_topic_id)
+            if send_as_peer:
+                kwargs["send_as"] = send_as_peer
 
-            forwarded = await client.forward_messages(**kwargs)
-            if isinstance(forwarded, list):
-                return [m.id for m in forwarded if m]
-            elif forwarded:
-                return [forwarded.id]
-            return []
+            req = functions.messages.ForwardMessagesRequest(**kwargs)
+            result = await client(req)
+
+            sent_ids = []
+            if hasattr(result, 'updates'):
+                for upd in result.updates:
+                    if hasattr(upd, 'message') and hasattr(upd.message, 'id'):
+                        sent_ids.append(upd.message.id)
+            if not sent_ids and hasattr(result, 'id'):
+                sent_ids.append(result.id)
+            if not sent_ids and hasattr(client, '_get_response_message'):
+                try:
+                    msgs = client._get_response_message(req, result, to_peer)
+                    if msgs:
+                        if isinstance(msgs, list):
+                            sent_ids = [m.id for m in msgs if m]
+                        elif hasattr(msgs, 'id'):
+                            sent_ids = [msgs.id]
+                except Exception:
+                    pass
+
+            return sent_ids if sent_ids else list(batch_ids)
+
         except errors.FloodWaitError as fwe:
             logger.warning(f"FloodWait hit: sleeping {fwe.seconds}s")
             await asyncio.sleep(fwe.seconds + 5)
         except errors.ChatForwardsRestrictedError:
             raise
         except Exception as e:
-            logger.error(f"Batch forward error on attempt {attempt}: {e}")
+            logger.error(f"Batch forward error on attempt {attempt}: {e}", exc_info=True)
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(10)
     return None
@@ -403,10 +513,16 @@ async def forward_batch_clean(dest_entity, src_entity, batch_ids, dest_topic_id=
 
 @client.on(events.NewMessage(pattern=r'^/(?:start|help)$', outgoing=True))
 async def help_handler(event):
+    dest_str = state.get('dest_link') or 'Not Set'
+    dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(dest_str)
+    dest_topic_display = f" (Topic ID: `{dest_topic_id}`)" if dest_topic_id else ""
+
     help_text = (
         "🤖 **Telegram History Cloner & Topic Engine**\n\n"
         "⚡ **Features:**\n"
-        "• Native 100-batch forwarding without quote tag (`drop_author=True`)\n"
+        "• Native 100-batch forwarding directly into forum topics (`top_msg_id`)\n"
+        "• Live batch start & progress updates every 10 messages\n"
+        "• From-To Link forwarding: copy start & end message links\n"
         "• Multi-topic/channel queue: paste 10+ links and go to sleep!\n"
         "• Whole-group topic auto-discovery (fetches ALL topics in a group)\n"
         "• Anonymous Admin compatible & optional `/setsendas`\n"
@@ -414,26 +530,230 @@ async def help_handler(event):
         "• 5-min forward unlock auto-checker\n"
         "• Saved Messages Cloud Brain Storage\n\n"
         "📋 **Commands:**\n"
-        "• `/setdest <link>` — Set target group, channel, or topic\n"
+        "• `/setdest <link>` — Set target group, channel, or specific topic\n"
+        "• `/fromto <from_link> <to_link>` — Forward message range (same chat) OR forward from source to destination\n"
+        "• `/range <from_link> <to_link>` — Quick message range forwarder into destination topic\n"
+        "• `/clone [new|here] <link1> <link2>...` — Queue 1 or many topics/channels/ranges\n"
         "• `/setsendas <channel_link|off>` — Set channel to send as (or leave off for Anonymous Admin)\n"
-        "• `/clone [new|here] <link1> <link2>...` — Queue 1 or many topics/channels/full groups\n"
         "• `/queue` — View all pending/active items in queue\n"
         "• `/status` — Live dashboard, batch counts, delays\n"
         "• `/pause` / `/resume` — Pause or resume execution\n"
         "• `/stop` — Cancel active task & wipe queue\n"
         "• `/purge` — Bulk delete last forwarded messages from destination\n\n"
-        f"🎯 **Destination:** `{state.get('dest_link') or 'Not Set'}`\n"
+        f"🎯 **Destination:** `{dest_str}`{dest_topic_display}\n"
         f"👤 **Send As:** `{state.get('send_as_link') or 'Default (Anonymous if enabled)'}`"
     )
     await event.reply(help_text)
 
-@client.on(events.NewMessage(pattern=r'^/setdest\s+(.+)$', outgoing=True))
+@client.on(events.NewMessage(pattern=r'^/setdest(?:\s+(.+))?$', outgoing=True))
 async def set_dest_handler(event):
-    link = event.pattern_match.group(1).strip()
-    state["dest_link"] = link
-    save_local_config()
-    await sync_brain_storage()
-    await event.reply(f"🎯 **Destination saved permanently:**\n`{link}`")
+    raw = event.pattern_match.group(1)
+    if not raw:
+        dest = state.get("dest_link")
+        if dest:
+            dest_chat, dest_topic_id, _, _, _, has_topic = parse_destination_link(dest)
+            await event.reply(
+                f"🎯 **Current Destination:** `{dest}`\n"
+                f"• Target Chat ID: `{dest_chat}`\n"
+                f"• Target Topic ID: `{dest_topic_id or 'None (Root / Auto New)'}`"
+            )
+        else:
+            await event.reply("⚠️ **No destination set.** Usage: `/setdest <link_or_chat> [topic_id]`")
+        return
+
+    link = raw.strip()
+    dest_chat, dest_topic_id, _, _, _, has_topic = parse_destination_link(link)
+    if not dest_chat:
+        await event.reply("❌ **Error:** Destination link or chat ID is invalid.")
+        return
+
+    try:
+        dest_entity = await client.get_entity(dest_chat)
+        chat_title = getattr(dest_entity, 'title', str(dest_chat))
+        is_forum = getattr(dest_entity, 'forum', False)
+
+        topic_info = ""
+        if dest_topic_id:
+            topic_title = await get_topic_title(dest_entity, dest_topic_id) or f"Topic #{dest_topic_id}"
+            topic_info = f"\n🏷️ **Destination Topic:** *\"{topic_title}\"* (ID: `{dest_topic_id}`)\n📥 All forwarded messages will be delivered directly into this topic!"
+        elif is_forum:
+            topic_info = "\n📂 **Forum Supergroup detected** (no specific topic set).\nItems will create new topics per item, or use `/clone here` to post in root."
+
+        state["dest_link"] = link
+        save_local_config()
+        await sync_brain_storage()
+
+        await event.reply(
+            f"🎯 **Destination Saved Successfully!**\n\n"
+            f"📍 **Target Chat:** *\"{chat_title}\"* (`{dest_chat}`)"
+            f"{topic_info}\n"
+            f"🔗 `{link}`"
+        )
+    except Exception as e:
+        state["dest_link"] = link
+        save_local_config()
+        await sync_brain_storage()
+        await event.reply(
+            f"🎯 **Destination saved:** `{link}`\n"
+            f"*(Entity notice: `{e}` - will resolve on execution)*"
+        )
+
+@client.on(events.NewMessage(pattern=r'^/(?:fromto|setfromto|range)(?:\s+([\s\S]+))?$', outgoing=True))
+async def fromto_handler(event):
+    if state.get("is_running"):
+        await event.reply("⚠️ A clone queue is actively processing! Use `/queue`, `/status`, or `/stop`.")
+        return
+
+    raw_input = event.pattern_match.group(1)
+    if not raw_input:
+        await event.reply(
+            "⚠️ **From-To Link Forwarder Usage:**\n\n"
+            "• `/fromto <from_link> <to_link>`\n"
+            "  - **Same chat:** Forwards message range from `from_link` to `to_link` into your set destination topic.\n"
+            "  - **Different chats:** Sets `to_link` as destination and forwards `from_link` into it!\n\n"
+            "• `/range <start_msg_link> <end_msg_link>`\n"
+            "  - Forwards the range of messages directly into the destination topic.\n\n"
+            "**Examples:**\n"
+            "• `/fromto https://t.me/c/123/10 https://t.me/c/123/150`\n"
+            "• `/fromto https://t.me/c/123/55/10 https://t.me/c/123/55/150`\n"
+            "• `/fromto https://t.me/source/10-100 https://t.me/c/dest/42`"
+        )
+        return
+
+    raw_links = re.findall(r'https?://t\.me/[^\s]+', raw_input)
+    if len(raw_links) < 2:
+        await event.reply("❌ **Error:** Please provide both a FROM link and a TO link.")
+        return
+
+    link1, link2 = raw_links[0], raw_links[1]
+    c1, t1, s1, e1, r1, h1 = parse_telegram_link(link1)
+    c2, t2, s2, e2, r2, h2 = parse_telegram_link(link2)
+
+    if not c1 or not c2:
+        await event.reply("❌ Could not parse one or both Telegram links.")
+        return
+
+    # Check if both links belong to the same chat -> message range forwarding
+    if c1 == c2:
+        if not state.get("dest_link"):
+            await event.reply("❌ **Destination not set!** Use `/setdest <link>` first.")
+            return
+
+        dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(state["dest_link"])
+        if not dest_chat:
+            await event.reply("❌ Destination link is invalid. Please reset with `/setdest`.")
+            return
+
+        try:
+            dest_entity = await client.get_entity(dest_chat)
+            src_entity = await client.get_entity(c1)
+        except Exception as e:
+            await event.reply(f"❌ Error resolving entity: `{e}`")
+            return
+
+        m1 = s1
+        m2 = s2
+        if not m1 or not m2:
+            await event.reply("❌ Both links must point to specific messages to form a range.")
+            return
+
+        start_id = min(m1, m2)
+        end_id = max(m1, m2)
+        tid = t1 if h1 else (t2 if h2 else None)
+
+        title = None
+        if tid and tid > 1:
+            title = await get_topic_title(src_entity, tid)
+        if not title:
+            title = getattr(src_entity, 'title', None) or f"Chat_{c1}"
+        title = f"{title} (Msg {start_id}–{end_id})"
+
+        mode = "here" if dest_has_topic else "new"
+        task = {
+            "title": title,
+            "source_link": f"{link1} -> {link2}",
+            "src_chat": c1,
+            "src_topic_id": tid,
+            "start_id": start_id,
+            "end_id": end_id,
+            "is_range": True,
+            "mode": mode,
+            "target_topic_id": dest_topic_id
+        }
+
+        state["queue"] = [task]
+        state["queue_index"] = 0
+        state["is_running"] = True
+        state["is_paused"] = False
+        save_local_config()
+        await sync_brain_storage()
+
+        dest_topic_desc = f"Topic #{dest_topic_id}" if dest_topic_id else "Main"
+        status_msg = await event.reply(
+            f"🚀 **From-To Range Task Queued!**\n\n"
+            f"📚 Source: *\"{title}\"*\n"
+            f"🔢 Range: Message `{start_id}` ➔ `{end_id}` (`{end_id - start_id + 1}` msgs)\n"
+            f"🎯 Destination: `{state['dest_link']}` ({dest_topic_desc})\n\n"
+            f"▶️ Starting pipeline..."
+        )
+        asyncio.create_task(run_queue_pipeline(dest_entity, status_msg))
+
+    else:
+        # Different chats -> link1 is source, link2 is destination!
+        state["dest_link"] = link2
+        save_local_config()
+        await sync_brain_storage()
+
+        dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(link2)
+        try:
+            dest_entity = await client.get_entity(dest_chat)
+            dest_title = getattr(dest_entity, 'title', str(dest_chat))
+        except Exception as e:
+            await event.reply(f"❌ Error resolving destination `{link2}`: `{e}`")
+            return
+
+        try:
+            src_entity = await client.get_entity(c1)
+            src_title = getattr(src_entity, 'title', str(c1))
+        except Exception as e:
+            await event.reply(f"❌ Error resolving source `{link1}`: `{e}`")
+            return
+
+        topic_title = None
+        if t1 and t1 > 1:
+            topic_title = await get_topic_title(src_entity, t1)
+        if not topic_title:
+            topic_title = src_title
+
+        mode = "here" if dest_has_topic else "new"
+        task = {
+            "title": topic_title,
+            "source_link": link1,
+            "src_chat": c1,
+            "src_topic_id": t1 if h1 else None,
+            "start_id": s1,
+            "end_id": e1,
+            "is_range": r1,
+            "mode": mode,
+            "target_topic_id": dest_topic_id
+        }
+
+        state["queue"] = [task]
+        state["queue_index"] = 0
+        state["is_running"] = True
+        state["is_paused"] = False
+        save_local_config()
+        await sync_brain_storage()
+
+        dest_desc = f"Topic #{dest_topic_id}" if dest_topic_id else "Main"
+        status_msg = await event.reply(
+            f"🎯 **From-To Pipeline Activated!**\n\n"
+            f"📥 **Destination Updated:** *\"{dest_title}\"* ({dest_desc})\n"
+            f"📤 **Source Queued:** *\"{topic_title}\"*\n"
+            f"🔗 `{link1}` ➔ `{link2}`\n\n"
+            f"▶️ Starting batch clone pipeline..."
+        )
+        asyncio.create_task(run_queue_pipeline(dest_entity, status_msg))
 
 @client.on(events.NewMessage(pattern=r'^/setsendas(?:\s+(.+))?$', outgoing=True))
 async def set_send_as_handler(event):
@@ -479,16 +799,22 @@ async def status_handler(event):
     q_len = len(q)
     q_idx = state.get("queue_index", 0) + 1 if q_len > 0 else 0
 
+    dest_str = state.get('dest_link') or 'Not Set'
+    dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(dest_str)
+    dest_topic_info = f" (Topic: `{dest_topic_id}`)" if dest_topic_id else ""
+
     status_text = (
         f"📊 **Cloner Engine Status:**\n\n"
         f"• **State:** `{state.get('current_status', 'Idle')}`\n"
         f"• **Running:** `{'Yes' if state.get('is_running') else 'No'}` | **Paused:** `{'Yes' if state.get('is_paused') else 'No'}`\n"
-        f"• **Destination:** `{state.get('dest_link') or 'Not Set'}`\n"
+        f"• **Destination:** `{dest_str}`{dest_topic_info}\n"
         f"• **Queue Progress:** `{q_idx}/{q_len}` items\n"
     )
     if task:
+        task_topic = task.get('target_topic_id')
+        target_info = f" -> Topic #{task_topic}" if task_topic else ""
         status_text += (
-            f"• **Current Task:** *\"{task.get('title')}\"*\n"
+            f"• **Current Task:** *\"{task.get('title')}\"*{target_info}\n"
             f"• **Mode:** `{task.get('mode')}`\n"
             f"• **Processed Batches:** `{task.get('batches_done', 0)}`\n"
             f"• **Messages Transferred:** `{len(state.get('last_sent_ids', []))}`\n"
@@ -547,7 +873,7 @@ async def purge_handler(event):
         await event.reply("❌ Destination link missing.")
         return
 
-    dest_chat, _, _, _, _, _ = parse_telegram_link(state["dest_link"])
+    dest_chat, _, _, _, _, _ = parse_destination_link(state["dest_link"])
     prog = await event.reply(f"🗑️ **Purging {len(sent_ids)} messages from destination in chunks of 100...**")
 
     deleted = 0
@@ -573,13 +899,15 @@ async def clone_handler(event):
         await event.reply("⚠️ A clone queue is actively processing! Use `/queue`, `/status`, or `/stop`.")
         return
 
-    if not state.get("dest_link"):
-        await event.reply("❌ **Error:** Set destination first using `/setdest <link>`.")
-        return
-
     raw_input = event.pattern_match.group(1)
     if not raw_input:
-        await event.reply("⚠️ **Usage:** `/clone [new|here] <link1> <link2>...`")
+        await event.reply("⚠️ **Usage:** `/clone [new|here] <link1> <link2>...` or `/clone <from_link> to <to_link>`")
+        return
+
+    # Extract all Telegram links from the message
+    raw_links = re.findall(r'https?://t\.me/[^\s]+', raw_input)
+    if not raw_links:
+        await event.reply("❌ **Error:** No valid Telegram links detected in your message.")
         return
 
     # Extract forced mode (new or here) if present
@@ -589,13 +917,25 @@ async def clone_handler(event):
     if first_word in ['new', 'here']:
         forced_mode = first_word
 
-    # Extract all Telegram links from the message
-    raw_links = re.findall(r'https?://t\.me/[^\s]+', raw_input)
-    if not raw_links:
-        await event.reply("❌ **Error:** No valid Telegram links detected in your message.")
+    has_to_keyword = bool(re.search(r'\bto\b', raw_input, re.IGNORECASE))
+    has_from_keyword = bool(re.search(r'\bfrom\b', raw_input, re.IGNORECASE))
+
+    # Check if this is a From-To link setup where link2 is destination
+    if len(raw_links) == 2 and (has_to_keyword or has_from_keyword):
+        c1, _, _, _, _, _ = parse_telegram_link(raw_links[0])
+        c2, _, _, _, _, _ = parse_telegram_link(raw_links[1])
+        if c1 and c2 and c1 != c2:
+            # Different chats with "to" or "from" keyword -> link2 is destination!
+            state["dest_link"] = raw_links[1]
+            save_local_config()
+            await sync_brain_storage()
+            raw_links = [raw_links[0]]
+
+    if not state.get("dest_link"):
+        await event.reply("❌ **Error:** Set destination first using `/setdest <link>` or use `/fromto <from> <to>`.")
         return
 
-    dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_telegram_link(state["dest_link"])
+    dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(state["dest_link"])
     if not dest_chat:
         await event.reply("❌ **Error:** Destination link is invalid or unparseable.")
         return
@@ -606,78 +946,113 @@ async def clone_handler(event):
         await event.reply(f"❌ Could not resolve destination: `{e}`")
         return
 
-    status_msg = await event.reply(f"🔍 **Analyzing {len(raw_links)} provided link(s)...**")
+    status_msg = await event.reply(f"🔍 **Analyzing provided link(s)...**")
 
     new_queue = []
 
-    for link in raw_links:
-        src_chat, src_topic_id, start_id, end_id, is_range, has_explicit_topic = parse_telegram_link(link)
-        if not src_chat:
-            continue
+    # Check if exactly 2 links from the same chat were provided -> pair as From-To range!
+    if len(raw_links) == 2:
+        c1, t1, s1, e1, r1, h1 = parse_telegram_link(raw_links[0])
+        c2, t2, s2, e2, r2, h2 = parse_telegram_link(raw_links[1])
+        if c1 and c2 and c1 == c2 and s1 and s2:
+            start_val = min(s1, s2)
+            end_val = max(s1, s2)
+            tid = t1 if h1 else (t2 if h2 else None)
+            try:
+                src_entity = await client.get_entity(c1)
+                t_title = None
+                if tid and tid > 1:
+                    t_title = await get_topic_title(src_entity, tid)
+                if not t_title:
+                    t_title = getattr(src_entity, 'title', None) or f"Chat_{c1}"
+                t_title = f"{t_title} (Msg {start_val}–{end_val})"
 
-        try:
-            src_entity = await client.get_entity(src_chat)
-        except Exception as e:
-            logger.error(f"Error resolving {link}: {e}")
-            continue
+                mode = forced_mode or ("here" if dest_has_topic else "new")
+                new_queue.append({
+                    "title": t_title,
+                    "source_link": f"{raw_links[0]} -> {raw_links[1]}",
+                    "src_chat": c1,
+                    "src_topic_id": tid,
+                    "start_id": start_val,
+                    "end_id": end_val,
+                    "is_range": True,
+                    "mode": mode,
+                    "target_topic_id": dest_topic_id
+                })
+            except Exception as e:
+                logger.error(f"Error resolving link pair: {e}")
 
-        # Check if the link is a whole forum group (no explicit topic specified)
-        is_forum = getattr(src_entity, 'forum', False)
-        if is_forum and not has_explicit_topic and not start_id:
-            # Whole group topic auto-discovery!
-            await status_msg.edit(f"📂 **Forum group detected!** Auto-discovering all topics in *\"{getattr(src_entity, 'title', link)}\"*...")
-            topics = await fetch_all_group_topics(src_entity)
-            if topics:
-                for t in topics:
-                    mode = forced_mode or ("here" if dest_has_topic else "new")
-                    new_queue.append({
-                        "title": t["title"],
-                        "source_link": f"https://t.me/c/{str(src_chat).replace('-100', '')}/{t['topic_id']}",
-                        "src_chat": src_chat,
-                        "src_topic_id": t["topic_id"],
-                        "start_id": None,
-                        "end_id": None,
-                        "is_range": False,
-                        "mode": mode
-                    })
+    # If not paired as a 2-link range, process links individually
+    if not new_queue:
+        for link in raw_links:
+            src_chat, src_topic_id, start_id, end_id, is_range, has_explicit_topic = parse_telegram_link(link)
+            if not src_chat:
                 continue
 
-        # Single topic, single channel, or explicit range
-        final_topic_id = None
-        final_start_id = start_id
+            try:
+                src_entity = await client.get_entity(src_chat)
+            except Exception as e:
+                logger.error(f"Error resolving {link}: {e}")
+                continue
 
-        if is_forum:
-            if has_explicit_topic:
-                # 3 segments: /c/chat/topic/message -> topic is seg1, start is seg2
-                final_topic_id = src_topic_id
-                final_start_id = start_id
-            elif src_topic_id:
-                # 2 segments in a forum: /c/chat/topic -> clone whole topic
-                final_topic_id = src_topic_id
-                final_start_id = None
-        else:
-            # Regular channel or non-forum group: NO TOPICS EXIST!
-            # Single segment is a message ID (start_id), never a topic ID
+            # Check if the link is a whole forum group (no explicit topic specified)
+            is_forum = getattr(src_entity, 'forum', False)
+            if is_forum and not has_explicit_topic and not start_id:
+                # Whole group topic auto-discovery!
+                await status_msg.edit(f"📂 **Forum group detected!** Auto-discovering all topics in *\"{getattr(src_entity, 'title', link)}\"*...")
+                topics = await fetch_all_group_topics(src_entity)
+                if topics:
+                    for t in topics:
+                        mode = forced_mode or ("here" if dest_has_topic else "new")
+                        new_queue.append({
+                            "title": t["title"],
+                            "source_link": f"https://t.me/c/{str(src_chat).replace('-100', '')}/{t['topic_id']}",
+                            "src_chat": src_chat,
+                            "src_topic_id": t["topic_id"],
+                            "start_id": None,
+                            "end_id": None,
+                            "is_range": False,
+                            "mode": mode,
+                            "target_topic_id": dest_topic_id
+                        })
+                    continue
+
+            # Single topic, single channel, or explicit range
             final_topic_id = None
             final_start_id = start_id
 
-        topic_title = None
-        if final_topic_id and final_topic_id > 1:
-            topic_title = await get_topic_title(src_entity, final_topic_id)
-        if not topic_title:
-            topic_title = getattr(src_entity, 'title', None) or f"Topic_{final_topic_id or 'Transfer'}"
+            if is_forum:
+                if has_explicit_topic:
+                    # 3 segments: /c/chat/topic/message -> topic is seg1, start is seg2
+                    final_topic_id = src_topic_id
+                    final_start_id = start_id
+                elif src_topic_id:
+                    # 2 segments in a forum: /c/chat/topic -> clone whole topic
+                    final_topic_id = src_topic_id
+                    final_start_id = None
+            else:
+                # Regular channel or non-forum group: NO TOPICS EXIST!
+                final_topic_id = None
+                final_start_id = start_id
 
-        mode = forced_mode or ("here" if dest_has_topic else "new")
-        new_queue.append({
-            "title": topic_title,
-            "source_link": link,
-            "src_chat": src_chat,
-            "src_topic_id": final_topic_id,
-            "start_id": final_start_id,
-            "end_id": end_id,
-            "is_range": is_range,
-            "mode": mode
-        })
+            topic_title = None
+            if final_topic_id and final_topic_id > 1:
+                topic_title = await get_topic_title(src_entity, final_topic_id)
+            if not topic_title:
+                topic_title = getattr(src_entity, 'title', None) or f"Topic_{final_topic_id or 'Transfer'}"
+
+            mode = forced_mode or ("here" if dest_has_topic else "new")
+            new_queue.append({
+                "title": topic_title,
+                "source_link": link,
+                "src_chat": src_chat,
+                "src_topic_id": final_topic_id,
+                "start_id": final_start_id,
+                "end_id": end_id,
+                "is_range": is_range,
+                "mode": mode,
+                "target_topic_id": dest_topic_id
+            })
 
     if not new_queue:
         await status_msg.edit("❌ No viable tasks could be compiled from the links provided.")
@@ -753,8 +1128,8 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
 
     src_entity = await client.get_entity(src_chat)
 
-    dest_chat, dest_topic_id, _, _, _, _ = parse_telegram_link(state["dest_link"])
-    target_topic_id = dest_topic_id
+    dest_chat, dest_topic_id, _, _, _, dest_has_topic = parse_destination_link(state["dest_link"])
+    target_topic_id = task.get("target_topic_id") or dest_topic_id
     start_ckpt = task.get("last_src_id") or task.get("start_id") or 0
 
     # --- PRE-FLIGHT DESTINATION CHECK & TOPIC SETUP ---
@@ -772,7 +1147,9 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
                 f"*(Transferred in 100-message batches)*\n"
                 f"📍 Checkpoint: `#SRC_ID:{start_ckpt}`"
             )
-            send_kwargs = {"reply_to": target_topic_id}
+            send_kwargs = {}
+            if target_topic_id:
+                send_kwargs["reply_to"] = target_topic_id
             if send_as_entity:
                 send_kwargs["send_as"] = send_as_entity
             h_msg = await client.send_message(dest_entity, header_text, **send_kwargs)
@@ -784,10 +1161,15 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
                 f"📍 Checkpoint: `#SRC_ID:{start_ckpt}`\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             )
-            send_kwargs = {"reply_to": target_topic_id}
+            send_kwargs = {}
+            if target_topic_id:
+                send_kwargs["reply_to"] = target_topic_id
             if send_as_entity:
                 send_kwargs["send_as"] = send_as_entity
-            h_msg = await client.send_message(dest_entity, header_text, **send_kwargs)
+            try:
+                h_msg = await client.send_message(dest_entity, header_text, **send_kwargs)
+            except Exception as e:
+                logger.warning(f"Could not send header divider message: {e}")
 
         if h_msg:
             task["header_msg_id"] = h_msg.id
@@ -803,13 +1185,7 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
                 pass
 
     except Exception as pfe:
-        logger.error(f"❌ Pre-flight destination check failed for task '{topic_title}': {pfe}")
-        if status_msg:
-            try:
-                await status_msg.edit(f"⚠️ **Pre-flight Check Failed for {topic_title}:** `{pfe}`\nSkipping to next queue item...")
-            except Exception:
-                pass
-        return
+        logger.warning(f"Pre-flight header setup warning for task '{topic_title}': {pfe}. Continuing forwarding...")
 
     # Build iter_messages arguments
     iter_kwargs = {'entity': src_entity, 'reverse': True}
@@ -823,6 +1199,20 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
         iter_kwargs['reply_to'] = src_topic_id
 
     batch_buffer = []
+    batch_num = task.get("batches_done", 0) + 1
+    q_idx = state.get("queue_index", 0) + 1
+    q_len = len(state.get("queue", []))
+    target_desc = f"Topic #{target_topic_id}" if target_topic_id else "Main"
+
+    # Announce start of batch
+    await safe_edit_status(
+        status_msg,
+        f"🚀 **Starting Batch #{batch_num} for *\"{topic_title}\"*...**\n\n"
+        f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
+        f"📦 Messages Collected: `0/{BATCH_SIZE}`\n"
+        f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
+        f"⚡ *Scanning source channel...*"
+    )
 
     async def message_stream():
         try:
@@ -842,7 +1232,7 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
 
     async for message in message_stream():
         while state.get("is_paused"):
-            await status_msg.edit(f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"* (ID: `{message.id}`).")
+            await safe_edit_status(status_msg, f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"* (ID: `{message.id}`).")
             await asyncio.sleep(2)
             if not state.get("is_running"):
                 return
@@ -857,14 +1247,52 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
 
         batch_buffer.append(message.id)
 
+        # Update progress after every 10 messages collected!
+        if len(batch_buffer) % 10 == 0 and len(batch_buffer) < BATCH_SIZE:
+            await safe_edit_status(
+                status_msg,
+                f"⏳ **Batch #{batch_num} in Progress...**\n\n"
+                f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
+                f"📦 Progress: `{len(batch_buffer)}/{BATCH_SIZE}` messages ready in batch\n"
+                f"🔍 Current Msg ID: `{message.id}`\n"
+                f"🎯 Target: `{target_desc}`\n"
+                f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
+                f"⚡ *Working actively...*"
+            )
+
         if len(batch_buffer) >= BATCH_SIZE:
+            await safe_edit_status(
+                status_msg,
+                f"📤 **Forwarding Batch #{batch_num} ({len(batch_buffer)} messages)...**\n\n"
+                f"📚 Active: *\"{topic_title}\"*\n"
+                f"🎯 Destination: `{target_desc}`\n"
+                f"🛡️ Mode: `drop_author=True`\n"
+                f"⏳ Dispatching to Telegram servers..."
+            )
             await process_and_send_batch(
                 status_msg, dest_entity, src_entity, batch_buffer,
                 target_topic_id, topic_title, send_as_entity
             )
             batch_buffer = []
+            batch_num = task.get("batches_done", 0) + 1
+            if state.get("is_running"):
+                await safe_edit_status(
+                    status_msg,
+                    f"🚀 **Starting Batch #{batch_num} for *\"{topic_title}\"*...**\n\n"
+                    f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
+                    f"📦 Messages Collected: `0/{BATCH_SIZE}`\n"
+                    f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
+                    f"⚡ *Scanning source channel...*"
+                )
 
     if batch_buffer and state.get("is_running"):
+        await safe_edit_status(
+            status_msg,
+            f"📤 **Forwarding Final Batch #{batch_num} ({len(batch_buffer)} messages)...**\n\n"
+            f"📚 Active: *\"{topic_title}\"*\n"
+            f"🎯 Destination: `{target_desc}`\n"
+            f"🛡️ Mode: `drop_author=True`"
+        )
         await process_and_send_batch(
             status_msg, dest_entity, src_entity, batch_buffer,
             target_topic_id, topic_title, send_as_entity
@@ -918,23 +1346,14 @@ async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids,
                 await client.edit_message(dest_entity, h_msg_id, updated_header)
             except Exception as e:
                 logger.debug(f"Could not update destination header checkpoint: {e}")
+    else:
+        logger.warning(f"Batch for '{topic_title}' returned no sent IDs.")
 
     q_idx = state.get("queue_index", 0) + 1
     q_len = len(state.get("queue", []))
     current_batch = state["active_task"].get("batches_done", 0) if state.get("active_task") else 0
     total_msgs = len(state["last_sent_ids"])
-
-    try:
-        await status_msg.edit(
-            f"⏳ **Processing Queue ({q_idx}/{q_len})...**\n\n"
-            f"📚 Active: *\"{topic_title}\"*\n"
-            f"📦 Batches Dispatched: `{current_batch}` (100 msgs/batch)\n"
-            f"📊 Total Transferred: `{total_msgs}` messages\n"
-            f"🛡️ Safety: Forward without quote (`drop_author`)\n"
-            f"☕ Next Breather in: `{state['next_breather_threshold'] - state['batches_since_breather']} batches`"
-        )
-    except Exception:
-        pass
+    target_desc = f"Topic #{target_topic_id}" if target_topic_id else "Main"
 
     # Breather Check (Every 4 to 8 batches, sleep for 5 to 8 minutes)
     if state["batches_since_breather"] >= state["next_breather_threshold"]:
@@ -944,15 +1363,15 @@ async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids,
         state["current_status"] = f"Taking human breather pause ({breather_mins} mins)"
         save_local_config()
 
-        try:
-            await status_msg.edit(
-                f"☕ **Human Breather Pause ({breather_mins} mins)...**\n\n"
-                f"Active Item: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
-                f"Mimicking natural human breaks. Zero risk of account flags.\n"
-                f"Auto-resuming in {int(breather_sleep)} seconds..."
-            )
-        except Exception:
-            pass
+        await safe_edit_status(
+            status_msg,
+            f"☕ **Human Breather Pause ({breather_mins} mins)...**\n\n"
+            f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
+            f"📦 Batches Done: `{current_batch}` | 📊 Total Transferred: `{total_msgs}`\n"
+            f"🎯 Target: `{target_desc}`\n"
+            f"🛡️ Mimicking natural human breaks (Zero account risk).\n"
+            f"⏳ Auto-resuming in {int(breather_sleep)}s..."
+        )
 
         for _ in range(int(breather_sleep // 5)):
             if not state.get("is_running") or state.get("is_paused"):
@@ -966,6 +1385,17 @@ async def process_and_send_batch(status_msg, dest_entity, src_entity, batch_ids,
         # Standard Batch Delay: 35 to 50 seconds
         batch_delay = random.uniform(BATCH_DELAY_MIN, BATCH_DELAY_MAX)
         logger.info(f"Sleeping {round(batch_delay, 1)}s before next batch...")
+
+        await safe_edit_status(
+            status_msg,
+            f"✅ **Batch #{current_batch} Delivered!** (`{len(sent_ids) if sent_ids else 0}` messages sent)\n\n"
+            f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
+            f"🎯 Target: `{target_desc}`\n"
+            f"📊 Total Transferred: `{total_msgs}` messages\n"
+            f"☕ Breather in: `{state['next_breather_threshold'] - state['batches_since_breather']} batches`\n"
+            f"⏳ Cooldown delay: `{round(batch_delay, 1)}s` before next batch..."
+        )
+
         for _ in range(int(batch_delay // 2)):
             if not state.get("is_running") or state.get("is_paused"):
                 break
@@ -1080,7 +1510,7 @@ async def main():
         curr_task = state["queue"][q_idx]
         logger.info(f"🔄 Cloud container reboot detected! Inspecting Smart Anchor for Task {q_idx + 1} ('{curr_task.get('title')}')...")
         try:
-            dest_chat, _, _, _, _, _ = parse_telegram_link(state["dest_link"])
+            dest_chat, _, _, _, _, _ = parse_destination_link(state["dest_link"])
             dest_entity = await client.get_entity(dest_chat)
 
             # Perform Smart Anchor check to prevent duplicate forwards if container crashed mid-batch
