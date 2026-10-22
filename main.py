@@ -1509,68 +1509,46 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
         if not unlocked:
             return
 
-        # Announce start of batch
-        current_total_sent = len(state.get("last_sent_ids", []))
-        await safe_edit_status(
-            status_msg,
-            f"🚀 **Starting Batch #{b_idx}/{total_batches} for *\"{topic_title}\"*...**\n\n"
-            f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
-            f"📦 Batch Size: `{len(batch_ids)}` messages (`0/{len(batch_ids)}` sent)\n"
-            f"📊 Total Transferred: `{current_total_sent}` messages\n"
-            f"⚡ *Dispatching in 10-message chunks...*"
-        )
-
-        # Dispatch batch in chunks of 10 messages for real-time live progress
-        sub_chunk_size = 10
-        sub_chunks = [batch_ids[j:j + sub_chunk_size] for j in range(0, len(batch_ids), sub_chunk_size)]
-        batch_sent_ids = []
-
-        for sub_idx, sub_ids in enumerate(sub_chunks, start=1):
-            while state.get("is_paused"):
-                await safe_edit_status(status_msg, f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"*.")
-                await asyncio.sleep(2)
-                if not state.get("is_running"):
-                    return
-
+        while state.get("is_paused"):
+            await safe_edit_status(status_msg, f"⏸️ **Queue Paused.** Holding at *\"{topic_title}\"*.")
+            await asyncio.sleep(2)
             if not state.get("is_running"):
                 return
 
-            try:
-                sent = await forward_batch_clean(dest_entity, src_entity, sub_ids, target_topic_id, send_as_entity)
-            except errors.ChatForwardsRestrictedError:
-                logger.warning("ChatForwardsRestrictedError caught during chunk forward! Waiting 5 min...")
-                await wait_until_unlocked(src_entity, status_msg)
-                sent = await forward_batch_clean(dest_entity, src_entity, sub_ids, target_topic_id, send_as_entity)
+        if not state.get("is_running"):
+            return
 
-            if sent:
-                batch_sent_ids.extend(sent)
-                state["last_sent_ids"].extend(sent)
-                highest_id = max(sub_ids)
-                if state.get("active_task"):
-                    state["active_task"]["last_src_id"] = highest_id
-                    state["active_task"]["start_id"] = highest_id + 1
-                if state.get("queue") and state.get("queue_index", 0) < len(state["queue"]):
-                    state["queue"][state["queue_index"]]["start_id"] = highest_id + 1
-                    state["queue"][state["queue_index"]]["last_src_id"] = highest_id
-                save_local_config()
-                await sync_brain_storage()
+        # Announce 100-message single API call dispatch
+        current_total_sent = len(state.get("last_sent_ids", []))
+        await safe_edit_status(
+            status_msg,
+            f"🚀 **Dispatching Batch #{b_idx}/{total_batches} for *\"{topic_title}\"*...**\n\n"
+            f"📋 Item: `{q_idx}/{q_len}` | 🎯 Target: `{target_desc}`\n"
+            f"📦 Batch Size: `{len(batch_ids)}` messages (**1 single API call**)\n"
+            f"📊 Total Transferred: `{current_total_sent}` messages\n"
+            f"⚡ *Forwarding in 1 MTProto request...*"
+        )
 
-            # Live update after EVERY 10 messages!
-            progress_in_batch = len(batch_sent_ids)
-            total_sent_so_far = len(state.get("last_sent_ids", []))
-            await safe_edit_status(
-                status_msg,
-                f"⏳ **Batch #{b_idx}/{total_batches} in Progress...**\n\n"
-                f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
-                f"📦 Batch Progress: `{progress_in_batch}/{len(batch_ids)}` messages delivered\n"
-                f"🎯 Target: `{target_desc}`\n"
-                f"📊 Total Transferred: `{total_sent_so_far}` messages\n"
-                f"⚡ *Actively transferring (Chunk {sub_idx}/{len(sub_chunks)})...*"
-            )
+        batch_sent_ids = []
+        try:
+            sent = await forward_batch_clean(dest_entity, src_entity, batch_ids, target_topic_id, send_as_entity)
+        except errors.ChatForwardsRestrictedError:
+            logger.warning("ChatForwardsRestrictedError caught during batch forward! Waiting 5 min...")
+            await wait_until_unlocked(src_entity, status_msg)
+            sent = await forward_batch_clean(dest_entity, src_entity, batch_ids, target_topic_id, send_as_entity)
 
-            # 2 second pause between 10-message chunks for smooth delivery
-            if sub_idx < len(sub_chunks) and state.get("is_running"):
-                await asyncio.sleep(2.0)
+        if sent:
+            batch_sent_ids.extend(sent)
+            state["last_sent_ids"].extend(sent)
+            highest_id = max(batch_ids)
+            if state.get("active_task"):
+                state["active_task"]["last_src_id"] = highest_id
+                state["active_task"]["start_id"] = highest_id + 1
+            if state.get("queue") and state.get("queue_index", 0) < len(state["queue"]):
+                state["queue"][state["queue_index"]]["start_id"] = highest_id + 1
+                state["queue"][state["queue_index"]]["last_src_id"] = highest_id
+            save_local_config()
+            await sync_brain_storage()
 
         # Batch completed!
         if state.get("active_task"):
@@ -1641,7 +1619,7 @@ async def execute_single_task(dest_entity, task, status_msg, send_as_entity):
 
             await safe_edit_status(
                 status_msg,
-                f"✅ **Batch #{b_idx}/{total_batches} Delivered!** (`{len(batch_sent_ids)}` messages sent)\n\n"
+                f"✅ **Batch #{b_idx}/{total_batches} Delivered!** (`{len(batch_sent_ids)}` messages in 1 API call)\n\n"
                 f"📚 Active: *\"{topic_title}\"* ({q_idx}/{q_len})\n"
                 f"🎯 Target: `{target_desc}`\n"
                 f"📊 Total Transferred: `{len(state.get('last_sent_ids', []))}` messages\n"
