@@ -10,6 +10,7 @@ def get_webapp_html():
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>TeleCloner Pro - Dashboard & Mini App</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -571,6 +572,15 @@ def get_webapp_html():
   </div>
 
   <script>
+    if (window.Telegram && window.Telegram.WebApp) {
+      try {
+        Telegram.WebApp.ready();
+        Telegram.WebApp.expand();
+      } catch (err) {
+        console.log('Telegram WebApp init: ', err);
+      }
+    }
+
     let currentPinMode = 'none';
     let analyzedData = null;
     let selectedTextIds = new Set();
